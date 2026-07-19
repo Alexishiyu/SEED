@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 BACKEND_NAME = "june24_skill_summary"
 SCHEMA_VERSION = "seed.june24_skill_summary.v1"
-ALL200_BANK_SCHEMA_VERSION = "seed.june24_skill_summary.all200.v1"
+ALL200_BANK_SCHEMA_VERSION = "seed.june24_skill_summary.all200.v2"
 ALL200_COHORT_SCHEMA_VERSION = "seed.june24_all200.v1"
 ALL200_SPLIT_SCHEMA_VERSION = "seed.june24_all200_split.v1"
 FIXED_SELECTION = "teacher_success_student_failed/fixed"
@@ -62,6 +62,16 @@ FORBIDDEN_FIELD_NAMES = {
     "ground_truth_target",
     "v2r",
 }
+
+# User-authorized exception for the historical June 24 all-200 experiment.
+# These exact source calls contain a second, repaired summarizer response.  The
+# exception is task-local, remains forbidden in the fixed-40 path, and is
+# recorded in the normalized bank without copying repair prompts/responses.
+KNOWN_JUNE24_REPAIRED_TASK_IDS = (
+    "multi_turn_base_56",
+    "multi_turn_base_154",
+    "multi_turn_base_169",
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -454,15 +464,32 @@ def validate_stratified_split_manifest(
     return train_ids, validation_ids, schedules
 
 
-def _extract_three_fields(source: Mapping[str, Any], task_id: str) -> dict[str, str]:
+def _repair_metadata_fields(source: Mapping[str, Any]) -> tuple[str, ...]:
+    fields = []
+    repair_attempts = source.get("repair_attempts")
+    if repair_attempts not in (None, []):
+        fields.append("repair_attempts")
+    if source.get("repair_request") is not None:
+        fields.append("repair_request")
+    if source.get("repair_response") is not None:
+        fields.append("repair_response")
+    return tuple(fields)
+
+
+def _extract_three_fields(
+    source: Mapping[str, Any],
+    task_id: str,
+    *,
+    allow_repaired: bool = False,
+) -> dict[str, str]:
     fallback = source.get("fallback")
     if fallback not in (None, False):
         raise ValueError(f"{task_id}: fallback June 24 skill records are forbidden")
-    repair_attempts = source.get("repair_attempts")
-    if repair_attempts not in (None, []):
+    repair_fields = _repair_metadata_fields(source)
+    if repair_fields and not allow_repaired:
         raise ValueError(f"{task_id}: repaired June 24 skill records are forbidden")
-    if source.get("repair_request") is not None or source.get("repair_response") is not None:
-        raise ValueError(f"{task_id}: repaired June 24 skill records are forbidden")
+    if allow_repaired and not repair_fields:
+        raise ValueError(f"{task_id}: repaired-record override was requested but no repair metadata exists")
     reference_mode = str(source.get("reference_mode") or "").strip().lower()
     if any(
         marker in reference_mode
@@ -546,6 +573,7 @@ def materialize_all200_training_skill_bank(
     cohort_manifest: Path,
     split_manifest: Path,
     output_path: Path,
+    allowed_repaired_task_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     cohort_value = _read_json(cohort_manifest)
     split_value = _read_json(split_manifest)
@@ -557,8 +585,16 @@ def materialize_all200_training_skill_bank(
         cohort_manifest=cohort_manifest,
     )
     train_set = set(train_ids)
+    allowed_repaired = tuple(allowed_repaired_task_ids)
+    if len(allowed_repaired) != len(set(allowed_repaired)):
+        raise ValueError("repaired-record override task ids contain duplicates")
+    unknown_repaired = sorted(set(allowed_repaired) - set(KNOWN_JUNE24_REPAIRED_TASK_IDS))
+    if unknown_repaired:
+        raise ValueError(f"unrecognized repaired-record overrides: {unknown_repaired}")
+    allowed_repaired_set = set(allowed_repaired)
     normalized_records = []
     source_calls = []
+    repaired_source_overrides = []
     for cohort_record in records:
         task_id = cohort_record["task_id"]
         candidates = [directory / f"skill_summary_call_{task_id}.json" for directory in source_dirs]
@@ -569,15 +605,30 @@ def materialize_all200_training_skill_bank(
         source = _read_json(source_path)
         if not isinstance(source, Mapping):
             raise ValueError(f"{task_id}: source call must be a JSON object")
-        fields = _extract_three_fields(source, task_id)
+        repair_fields = _repair_metadata_fields(source)
+        fields = _extract_three_fields(
+            source,
+            task_id,
+            allow_repaired=task_id in allowed_repaired_set,
+        )
         source_hash = sha256_file(source_path)
         source_calls.append(
             {
                 "task_id": task_id,
                 "source_call_path": str(source_path),
                 "source_call_sha256": source_hash,
+                "repaired_source_override": task_id in allowed_repaired_set,
             }
         )
+        if task_id in allowed_repaired_set:
+            repaired_source_overrides.append(
+                {
+                    "task_id": task_id,
+                    "source_call_path": str(source_path),
+                    "source_call_sha256": source_hash,
+                    "repair_metadata_fields": list(repair_fields),
+                }
+            )
         if task_id in train_set:
             normalized_records.append(
                 {
@@ -590,6 +641,8 @@ def materialize_all200_training_skill_bank(
     normalized_records.sort(key=lambda item: _bfcl_task_sort_key(item["task_id"]))
     if [record["task_id"] for record in normalized_records] != train_ids:
         raise ValueError("training skill records do not exactly match the frozen 160-task split")
+    if {item["task_id"] for item in repaired_source_overrides} != allowed_repaired_set:
+        raise ValueError("repaired-record overrides were not fully audited")
 
     bank = {
         "schema_version": ALL200_BANK_SCHEMA_VERSION,
@@ -602,6 +655,8 @@ def materialize_all200_training_skill_bank(
         "task_ids": train_ids,
         "source_task_count": len(source_calls),
         "source_calls": source_calls,
+        "repaired_source_policy": "explicit_historical_task_allowlist",
+        "repaired_source_overrides": repaired_source_overrides,
         "records": normalized_records,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -703,6 +758,32 @@ def load_skill_bank(
             f"multi_turn_base_{index}" for index in range(EXPECTED_ALL200_COUNT)
         ]:
             raise ValueError("all-200 source-call manifest does not cover canonical task ids 0 through 199")
+        overrides = value.get("repaired_source_overrides")
+        if value.get("repaired_source_policy") != "explicit_historical_task_allowlist" or not isinstance(
+            overrides, list
+        ):
+            raise ValueError("all-200 skill bank lacks an explicit repaired-source policy")
+        override_ids = [str(item.get("task_id") or "") for item in overrides if isinstance(item, Mapping)]
+        if len(override_ids) != len(overrides) or len(override_ids) != len(set(override_ids)):
+            raise ValueError("all-200 repaired-source overrides are malformed or duplicated")
+        if set(override_ids) - set(KNOWN_JUNE24_REPAIRED_TASK_IDS):
+            raise ValueError("all-200 skill bank contains an unauthorized repaired-source override")
+        flagged_ids = [
+            str(item.get("task_id") or "")
+            for item in source_calls
+            if isinstance(item, Mapping) and item.get("repaired_source_override") is True
+        ]
+        if flagged_ids != override_ids:
+            raise ValueError("all-200 repaired-source override audit does not match source calls")
+        for override in overrides:
+            task_id = str(override.get("task_id") or "")
+            source = next(item for item in source_calls if item.get("task_id") == task_id)
+            if (
+                override.get("source_call_path") != source.get("source_call_path")
+                or override.get("source_call_sha256") != source.get("source_call_sha256")
+                or not override.get("repair_metadata_fields")
+            ):
+                raise ValueError(f"{task_id}: repaired-source override provenance is incomplete")
         if verify_source_files:
             for item in source_calls:
                 source_path = Path(str(item.get("source_call_path") or "")).expanduser()

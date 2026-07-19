@@ -30,6 +30,12 @@ train-160/validation-40 experiment. It reads the canonical 200-row
 stratified split. The normalized runtime bank contains only the 160 training
 summaries while its source manifest records and verifies all 200 source-call
 paths and hashes. Validation summaries are never loaded into a prompt.
+The historical source calls for tasks 56, 154, and 169 contain repair metadata.
+For this all-200 experiment only, the builder accepts those exact task IDs via
+three explicit `--allow-repaired-task-id` flags. Their source paths, hashes,
+repair-metadata field names, and override status are persisted in the bank and
+final evidence. Any other repaired record still fails preflight. The fixed-40
+contract remains fully repair-intolerant.
 
 ## Agent and loss contract
 
@@ -92,7 +98,10 @@ python scripts/build_june24_all200_skill_bank.py \
   --source-dir /drive/bfcl_qwen_experiment/a100_skill_sd_150_50_199_20260624_063820/skills_openai \
   --cohort-manifest /run/inputs/june24_all200_cohort.json \
   --split-manifest /run/inputs/june24_train160_val40_split.json \
-  --output /run/inputs/june24_train160_skill_bank.json
+  --output /run/inputs/june24_train160_skill_bank.json \
+  --allow-repaired-task-id multi_turn_base_56 \
+  --allow-repaired-task-id multi_turn_base_154 \
+  --allow-repaired-task-id multi_turn_base_169
 ```
 
 Preflight or execute the continuous five-iteration job:

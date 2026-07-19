@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_SPLIT_SEED)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--allow-repaired-task-id",
+        action="append",
+        default=[],
+        help="Explicit historical task-level repair exception; repeat once per authorized task",
+    )
     return parser.parse_args()
 
 
@@ -52,6 +58,7 @@ def main() -> None:
         cohort_manifest=cohort_path,
         split_manifest=split_path,
         output_path=output_path,
+        allowed_repaired_task_ids=args.allow_repaired_task_id,
     )
     print(
         json.dumps(
@@ -62,6 +69,7 @@ def main() -> None:
                 "total_updates": split["training_schedule"]["total_updates"],
                 "total_rollouts": split["training_schedule"]["total_rollouts"],
                 "source_task_count": bank["source_task_count"],
+                "repaired_source_overrides": bank["repaired_source_overrides"],
                 "cohort_manifest": str(cohort_path),
                 "split_manifest": str(split_path),
                 "skill_bank": str(output_path),

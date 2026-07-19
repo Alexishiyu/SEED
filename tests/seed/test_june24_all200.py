@@ -9,6 +9,7 @@ from seed.june24_skill_summary import (
     EXPECTED_OUTCOME_COUNTS,
     EXPECTED_TRAIN_OUTCOME_COUNTS,
     EXPECTED_VALIDATION_OUTCOME_COUNTS,
+    KNOWN_JUNE24_REPAIRED_TASK_IDS,
     build_all200_cohort_manifest,
     build_stratified_split_manifest,
     load_skill_bank,
@@ -201,6 +202,60 @@ def test_all200_rejects_fallback_repair_or_structured_source_metadata(
             cohort_manifest=cohort_path,
             split_manifest=split_path,
             output_path=tmp_path / "rejected_metadata.json",
+        )
+
+
+def test_all200_allows_only_the_explicit_three_repaired_historical_records(tmp_path):
+    cohort_path, split_path, source_a, source_b = _all200_evidence(tmp_path)
+    for task_id in KNOWN_JUNE24_REPAIRED_TASK_IDS:
+        index = int(task_id.rsplit("_", 1)[-1])
+        source_dir = source_a if index < 50 else source_b
+        path = source_dir / f"skill_summary_call_{task_id}.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["repair_request"] = {"redacted": True}
+        value["repair_response"] = {"redacted": True}
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    bank_path = tmp_path / "allowed_repaired.json"
+    bank = materialize_all200_training_skill_bank(
+        source_dirs=[source_a, source_b],
+        cohort_manifest=cohort_path,
+        split_manifest=split_path,
+        output_path=bank_path,
+        allowed_repaired_task_ids=KNOWN_JUNE24_REPAIRED_TASK_IDS,
+    )
+    assert [item["task_id"] for item in bank["repaired_source_overrides"]] == list(
+        KNOWN_JUNE24_REPAIRED_TASK_IDS
+    )
+    assert all(item["repair_metadata_fields"] == ["repair_request", "repair_response"] for item in bank["repaired_source_overrides"])
+    assert sum(item["repaired_source_override"] is True for item in bank["source_calls"]) == 3
+    loaded = load_skill_bank(
+        bank_path,
+        cohort_manifest=cohort_path,
+        split_manifest=split_path,
+        verify_source_files=True,
+    )
+    assert len(loaded.records) == 160
+
+
+def test_all200_repaired_override_remains_fail_closed(tmp_path):
+    cohort_path, split_path, source_a, source_b = _all200_evidence(tmp_path)
+    with pytest.raises(ValueError, match="unrecognized repaired-record overrides"):
+        materialize_all200_training_skill_bank(
+            source_dirs=[source_a, source_b],
+            cohort_manifest=cohort_path,
+            split_manifest=split_path,
+            output_path=tmp_path / "unknown_override.json",
+            allowed_repaired_task_ids=["multi_turn_base_1"],
+        )
+
+    with pytest.raises(ValueError, match="no repair metadata exists"):
+        materialize_all200_training_skill_bank(
+            source_dirs=[source_a, source_b],
+            cohort_manifest=cohort_path,
+            split_manifest=split_path,
+            output_path=tmp_path / "stale_override.json",
+            allowed_repaired_task_ids=KNOWN_JUNE24_REPAIRED_TASK_IDS,
         )
 
 

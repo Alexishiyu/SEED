@@ -12,6 +12,7 @@ from typing import Any
 from seed.june24_skill_summary import (
     EXPECTED_TRAIN_OUTCOME_COUNTS,
     EXPECTED_VALIDATION_OUTCOME_COUNTS,
+    KNOWN_JUNE24_REPAIRED_TASK_IDS,
     sha256_file,
     validate_all200_cohort_manifest,
     validate_stratified_split_manifest,
@@ -281,6 +282,20 @@ def main() -> None:
         path = Path(source["source_call_path"])
         if not path.is_file() or sha256_file(path) != source["source_call_sha256"]:
             raise RuntimeError(f"source-call provenance drifted for {source.get('task_id')}")
+    overrides = provenance.get("repaired_source_overrides") or []
+    override_ids = [str(item.get("task_id") or "") for item in overrides]
+    if (
+        provenance.get("repaired_source_policy") != "explicit_historical_task_allowlist"
+        or override_ids != list(KNOWN_JUNE24_REPAIRED_TASK_IDS)
+    ):
+        raise RuntimeError("historical repaired-source exceptions differ from the authorized three-task allowlist")
+    flagged_ids = [
+        str(item.get("task_id") or "")
+        for item in source_calls
+        if item.get("repaired_source_override") is True
+    ]
+    if flagged_ids != override_ids:
+        raise RuntimeError("source-call repair flags differ from the authorized override evidence")
 
     updates = _update_evidence(
         run_root / "evidence" / "privileged_june24" / "updates",

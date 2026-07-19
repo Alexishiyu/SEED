@@ -513,6 +513,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "skill_bank_sha256": bank.sha256,
         **manifest_provenance,
         "source_calls": source_calls,
+        "repaired_source_policy": bank_value.get("repaired_source_policy"),
+        "repaired_source_overrides": bank_value.get("repaired_source_overrides") or [],
         "train_dataset_path": str(train_path),
         "train_dataset_sha256": sha256_file(train_path),
         "dataset_path": str(train_path),
