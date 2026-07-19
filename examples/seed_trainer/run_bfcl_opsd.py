@@ -229,7 +229,7 @@ def _hydra_command(
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.45",
         "actor_rollout_ref.rollout.enforce_eager=True",
-        "actor_rollout_ref.rollout.free_cache_engine=False",
+        "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False",
         f"actor_rollout_ref.rollout.max_model_len={total_model_len}",
         f"actor_rollout_ref.rollout.max_num_batched_tokens={total_model_len}",

@@ -112,6 +112,11 @@ def _safe_json_dumps(payload: Any, **kwargs: Any) -> str:
 SEED_STATE_GROUP_METRIC_PREFIX = "seed/state_group/"
 
 
+def _allows_missing_actor_entropy(*, opd_only: bool, entropy_coeff: float | None) -> bool:
+    """Return whether an entropy-free old-log-prob payload is intentional."""
+    return bool(opd_only) and float(entropy_coeff or 0.0) == 0.0
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -3511,13 +3516,35 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
+                        if "entropys" in old_log_prob.batch:
+                            entropys = old_log_prob.batch.pop("entropys")
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_loss = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            metrics["actor/entropy_loss"] = entropy_loss.detach().item()
+                        else:
+                            opd_only = self._config_bool(
+                                self.config,
+                                "actor_rollout_ref.actor.opd_only",
+                                False,
+                            )
+                            entropy_coeff = OmegaConf.select(
+                                self.config,
+                                "actor_rollout_ref.actor.entropy_coeff",
+                            )
+                            if not _allows_missing_actor_entropy(
+                                opd_only=opd_only,
+                                entropy_coeff=entropy_coeff,
+                            ):
+                                raise RuntimeError(
+                                    "actor compute_log_prob omitted entropys outside "
+                                    "opd_only=True with entropy_coeff=0"
+                                )
+                            metrics["actor/entropy_loss"] = 0.0
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():

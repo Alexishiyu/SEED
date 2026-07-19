@@ -77,6 +77,11 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _should_calculate_actor_entropy(*, opd_only: bool, entropy_coeff: float | None) -> bool:
+    """Skip the expensive full-vocabulary entropy only for strict OPD-only runs."""
+    return not (bool(opd_only) and float(entropy_coeff or 0.0) == 0.0)
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -749,13 +754,23 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        calculate_entropy = _should_calculate_actor_entropy(
+            opd_only=self.config.actor.get("opd_only", False),
+            entropy_coeff=self.config.actor.get("entropy_coeff", 0.0),
+        )
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys = self.actor.compute_log_prob(
+                    data=data,
+                    calculate_entropy=calculate_entropy,
+                )
+            tensors = {"old_log_probs": output}
+            if entropys is not None:
+                tensors["entropys"] = entropys
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
