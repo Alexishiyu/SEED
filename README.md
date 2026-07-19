@@ -240,6 +240,16 @@ bash examples/seed_trainer/run_webshop_sft_glm_self.sh
 bash examples/seed_trainer/run_search_sft_glm_self.sh
 ```
 
+### BFCL OPD-only with frozen June 24 skills
+
+The BFCL migration keeps SEED's native `TrajectoryCollector.multi_turn_loop`
+and unchanged OPD gate/loss, but replaces dynamic hindsight analysis with the
+frozen June 24 three-field Skill-SD summaries. It deliberately rejects V2R,
+possible answers, predicted calls/state, structured targets, fallback, repair,
+and external analyzer calls. See
+[`docs/bfcl_june24_opsd.md`](docs/bfcl_june24_opsd.md) and the A100 controller
+[`examples/seed_trainer/bfcl_seed_opsd_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_a100.ipynb).
+
 Other teacher-self SFT entrypoints use the same naming convention:
 
 ```bash
