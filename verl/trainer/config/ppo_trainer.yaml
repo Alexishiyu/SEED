@@ -56,6 +56,8 @@ actor_rollout_ref:
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     opd_loss_coef: 0.0 # OPD-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
     opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating
+    opd_only: False # optimize only the unchanged OPD objective; excludes PG, entropy, KL, reward, critic, and auxiliary losses
+    opd_evidence_path: null # optional rank-0 JSON path for before/after trainable-parameter SHA-256
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -284,6 +286,11 @@ algorithm:
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
+    june24_skill_bank: null # required only for analysis_backend=june24_skill_summary
+    june24_fixed_manifest: null # corrected fixed-40 cohort authority
+    june24_task_ids: null # comma-separated selected fixed-40 ids; coverage is validated before rollout
+    june24_same_prompt_control: False # re-score under the ordinary prompt for the paired K3 control
+    june24_verify_source_files: True # recompute every historical source-call SHA-256 before rollout
     analysis_prompt_version: "seed" # "seed" uses original SEED; "seed_visual" uses the SEED prompt format with image observations
     analysis_num_workers: 8
     analysis_context_length: 16384
@@ -376,3 +383,8 @@ env:
     generalization_level: 0
     simplifications_preset: easy
     jar_path: null
+  bfcl:
+    root: null
+    model_id: Qwen/Qwen3-4B-Instruct-2507
+    temperature: 0.001
+    max_steps_per_turn: 20

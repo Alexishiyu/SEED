@@ -29,6 +29,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Type
 
 import numpy as np
@@ -74,6 +75,12 @@ from seed.prompting import (
     validate_skill_mode,
 )
 from seed.skill_gen import SkillGenRewardConfig, compute_skill_gen_reward
+from seed.june24_skill_summary import (
+    BACKEND_NAME as JUNE24_BACKEND,
+    guidance_block as build_june24_guidance_block,
+    inject_guidance_into_system_prompt,
+    load_skill_bank as load_june24_skill_bank,
+)
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -535,6 +542,7 @@ class RayPPOTrainer:
         self.envs = envs
         self.val_envs = val_envs
         self._seed_analyzer = None
+        self._june24_skill_bank = None
         self._seed_teacher_adv_last_enabled_state = None
         self._seed_failed_only_last_enabled_state = None
         self._seed_analysis_last_enabled_state = None
@@ -932,6 +940,13 @@ class RayPPOTrainer:
             "anchor_obs",
             "traj_uid",
             "uid",
+            # The frozen June 24 backend resolves privileged context by the
+            # exact BFCL task identity carried by every sampled step.  Keep
+            # that identity (and its turn coordinates) in the asynchronous
+            # snapshot instead of relying on mutable environment state.
+            "task_id",
+            "bfcl_turn_id",
+            "bfcl_step_in_turn",
             "data_source",
             "episode_success",
             "episode_rewards",
@@ -1020,6 +1035,32 @@ class RayPPOTrainer:
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        opd_only = self._config_bool(config, "actor_rollout_ref.actor.opd_only", False)
+        if opd_only:
+            if not (
+                config.algorithm.adv_estimator == AdvantageEstimator.SEED
+                or str(config.algorithm.adv_estimator) == AdvantageEstimator.SEED.value
+            ):
+                raise ValueError("actor.opd_only requires algorithm.adv_estimator=seed")
+            forbidden_settings = {
+                "algorithm.use_kl_in_reward": self._config_bool(config, "algorithm.use_kl_in_reward", False),
+                "actor.use_kl_loss": self._config_bool(config, "actor_rollout_ref.actor.use_kl_loss", False),
+                "reward_model.enable": self._config_bool(config, "reward_model.enable", False),
+                "actor.use_invalid_action_penalty": self._config_bool(
+                    config, "actor_rollout_ref.actor.use_invalid_action_penalty", False
+                ),
+            }
+            active = [name for name, enabled in forbidden_settings.items() if enabled]
+            if active:
+                raise ValueError(f"actor.opd_only forbids RL/RM/KL settings: {active}")
+            for key in (
+                "actor_rollout_ref.actor.entropy_coeff",
+                "actor_rollout_ref.actor.skill_gen_loss_coef",
+                "actor_rollout_ref.actor.sp_coef",
+                "actor_rollout_ref.actor.id_coef",
+            ):
+                if float(OmegaConf.select(config, key) or 0.0) != 0.0:
+                    raise ValueError(f"actor.opd_only requires {key}=0.0")
         opd_stop_after_steps = OmegaConf.select(config, "algorithm.seed.opd_stop_after_steps")
         opd_start_after_steps = OmegaConf.select(config, "algorithm.seed.opd_start_after_steps")
         legacy_teacher_advantage_start_after_steps = OmegaConf.select(
@@ -1078,8 +1119,25 @@ class RayPPOTrainer:
                 analysis_enabled = analysis_enabled_config.lower() in ("1", "true", "yes", "on")
             else:
                 analysis_enabled = bool(analysis_enabled_config)
-            if analysis_backend not in {"openai", "policy_vllm"}:
-                raise ValueError("algorithm.seed.analysis_backend must be 'openai' or 'policy_vllm'.")
+            if analysis_backend not in {"openai", "policy_vllm", JUNE24_BACKEND}:
+                raise ValueError(
+                    "algorithm.seed.analysis_backend must be 'openai', 'policy_vllm', "
+                    f"or '{JUNE24_BACKEND}'."
+                )
+            if analysis_backend == JUNE24_BACKEND:
+                if str(OmegaConf.select(config, "env.env_name") or "").lower() != "bfcl":
+                    raise ValueError("june24_skill_summary is supported only with env.env_name=bfcl")
+                if skill_mode != "episode_only":
+                    raise ValueError("june24_skill_summary requires algorithm.seed.skill_mode=episode_only")
+                if not self._config_bool(config, "actor_rollout_ref.actor.opd_only", False):
+                    raise ValueError("june24_skill_summary requires actor_rollout_ref.actor.opd_only=True")
+                if float(OmegaConf.select(config, "actor_rollout_ref.actor.opd_loss_coef") or 0.0) <= 0:
+                    raise ValueError("june24_skill_summary requires a positive actor.opd_loss_coef")
+                if self._config_bool(config, "algorithm.seed.skill_gen.enable", False):
+                    raise ValueError("june24_skill_summary forbids dynamic skill generation")
+                if float(OmegaConf.select(config, "actor_rollout_ref.actor.skill_gen_loss_coef") or 0.0) != 0.0:
+                    raise ValueError("june24_skill_summary forbids skill-generation loss")
+                self._lazy_init_june24_skill_bank()
             if analysis_backend == "policy_vllm" and analysis_enabled:
                 if str(config.actor_rollout_ref.rollout.name) != "vllm":
                     raise ValueError("algorithm.seed.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
@@ -1975,6 +2033,8 @@ class RayPPOTrainer:
             )
 
     def _lazy_init_seed_analyzer(self):
+        if str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend")) == JUNE24_BACKEND:
+            return self._lazy_init_june24_skill_bank()
         if self._seed_analyzer is None:
             max_step_skills_per_traj = OmegaConf.select(
                 self.config,
@@ -2005,6 +2065,46 @@ class RayPPOTrainer:
                 include_episode_summary=include_episode_summary,
             )
         return self._seed_analyzer
+
+    def _get_june24_task_ids(self) -> List[str]:
+        value = OmegaConf.select(self.config, "algorithm.seed.june24_task_ids")
+        if value is None:
+            return []
+        if isinstance(value, str):
+            task_ids = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            task_ids = [str(item).strip() for item in value if str(item).strip()]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("algorithm.seed.june24_task_ids contains duplicates")
+        return task_ids
+
+    def _lazy_init_june24_skill_bank(self):
+        if self._june24_skill_bank is None:
+            skill_bank = OmegaConf.select(self.config, "algorithm.seed.june24_skill_bank")
+            fixed_manifest = OmegaConf.select(self.config, "algorithm.seed.june24_fixed_manifest")
+            if not skill_bank or not fixed_manifest:
+                raise ValueError(
+                    "june24_skill_summary requires algorithm.seed.june24_skill_bank and "
+                    "algorithm.seed.june24_fixed_manifest"
+                )
+            verify_sources = self._config_bool(
+                self.config,
+                "algorithm.seed.june24_verify_source_files",
+                True,
+            )
+            self._june24_skill_bank = load_june24_skill_bank(
+                Path(str(skill_bank)),
+                fixed_manifest=Path(str(fixed_manifest)),
+                required_task_ids=self._get_june24_task_ids(),
+                verify_source_files=verify_sources,
+            )
+            module_logger.info(
+                "Loaded frozen June 24 skill bank sha256=%s fixed_manifest_sha256=%s tasks=%s",
+                self._june24_skill_bank.sha256,
+                self._june24_skill_bank.fixed_manifest_sha256,
+                len(self._june24_skill_bank.records),
+            )
+        return self._june24_skill_bank
 
     def _get_seed_failure_success_threshold(self) -> float:
         threshold = OmegaConf.select(self.config, "algorithm.seed.failure_success_threshold")
@@ -2292,6 +2392,29 @@ class RayPPOTrainer:
         )
         print(f"SEED analysis backend: {backend}, configured_workers: {configured_workers}, max_workers: {max_workers}")
 
+        if backend == JUNE24_BACKEND:
+            bank = self._lazy_init_june24_skill_bank()
+            results = {}
+            for traj_uid, task in analysis_tasks.items():
+                task_id = str(task.get("task_id") or "")
+                summary = bank.summary(task_id)
+                results[traj_uid] = {
+                    "episode_summary": "",
+                    "episode_skill": build_june24_guidance_block(task_id, summary).strip(),
+                    "step_skills": {},
+                    "analysis_backend_requested": JUNE24_BACKEND,
+                    "analysis_backend_used": JUNE24_BACKEND,
+                    "analysis_error": None,
+                    "analysis_mode": "frozen_june24_skill_summary",
+                    "analysis_prompt_version": "seed",
+                    "skill_mode": "episode_only",
+                    "task_id": task_id,
+                    "june24_summary": dict(summary),
+                    "skill_bank_sha256": bank.sha256,
+                    "source_call_path": summary["source_call_path"],
+                    "source_call_sha256": summary["source_call_sha256"],
+                }
+            return results, 0
         if backend == "policy_vllm":
             return self._analyze_seed_episodes_with_policy_vllm(
                 analyzer=analyzer,
@@ -2463,6 +2586,15 @@ class RayPPOTrainer:
 
         episode_analysis: Dict[object, Dict[str, object]] = {}
         analysis_tasks: Dict[object, Dict[str, object]] = {}
+        traj_task_ids: Dict[object, str] = {}
+        if str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend")) == JUNE24_BACKEND:
+            if "task_id" not in batch.non_tensor_batch:
+                raise ValueError("June 24 BFCL OPD rollout batch is missing task_id metadata")
+            for sample_idx, traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
+                task_id = str(batch.non_tensor_batch["task_id"][sample_idx])
+                previous = traj_task_ids.setdefault(traj_uid, task_id)
+                if previous != task_id:
+                    raise ValueError(f"trajectory {traj_uid} mixes BFCL tasks {previous} and {task_id}")
         traj_success = self._build_seed_traj_success_map(batch)
         if failed_only and not traj_success:
             module_logger.warning(
@@ -2506,6 +2638,7 @@ class RayPPOTrainer:
                 "candidate_step_indices": candidate_step_indices,
                 "analysis_mode": analysis_mode,
                 "episode_success": traj_success.get(traj_uid),
+                "task_id": traj_task_ids.get(traj_uid),
             }
         analyzed, analysis_workers = self._analyze_seed_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
         episode_analysis.update(analyzed)
@@ -2675,10 +2808,25 @@ class RayPPOTrainer:
                 skill_mode=skill_mode,
             )
             if use_episode_skill:
-                episode_enhanced_obs = build_augmented_observation_text(
-                    observation=observation_text,
-                    episode_skill=episode_skill,
-                )
+                if str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend")) == JUNE24_BACKEND:
+                    task_id = str(analysis["task_id"])
+                    if self._config_bool(
+                        self.config,
+                        "algorithm.seed.june24_same_prompt_control",
+                        False,
+                    ):
+                        episode_enhanced_obs = observation_text
+                    else:
+                        episode_enhanced_obs = inject_guidance_into_system_prompt(
+                            observation_text,
+                            task_id,
+                            analysis["june24_summary"],
+                        )
+                else:
+                    episode_enhanced_obs = build_augmented_observation_text(
+                        observation=observation_text,
+                        episode_skill=episode_skill,
+                    )
                 episode_obs_texts.append(episode_enhanced_obs)
                 episode_data_sources.append(data_source)
                 episode_prompt_images.append(
@@ -2775,6 +2923,7 @@ class RayPPOTrainer:
                 data_sources=data_sources,
                 meta_info=teacher_meta_info,
                 images=prompt_images if use_prompt_images else None,
+                preformatted=[str(source) == "bfcl" for source in data_sources],
             )
             prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
             module_logger.info(
@@ -2811,12 +2960,18 @@ class RayPPOTrainer:
                 non_tensors=teacher_non_tensors,
                 meta_info=teacher_meta_info,
             )
+            if not torch.equal(teacher_batch.batch["responses"], responses):
+                raise RuntimeError(f"SEED {label} teacher/student response-token alignment failed")
             teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
                 teacher_batch,
                 self.actor_rollout_wg.world_size,
             )
             teacher_log_prob_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
             teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size)
+            if teacher_log_prob.batch["old_log_probs"].shape != responses.shape:
+                raise RuntimeError(
+                    f"SEED {label} teacher log-prob shape does not align with sampled responses"
+                )
             return teacher_log_prob.batch["old_log_probs"]
 
         full_episode_teacher_log_prob = zero_teacher_log_prob.clone()
@@ -2892,6 +3047,11 @@ class RayPPOTrainer:
         batch.batch["critical_step_mask"] = episode_skill_mask
         batch.batch["step_skill_mask"] = step_skill_mask
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
+        metrics["seed/teacher_student_token_alignment"] = 1.0
+        metrics["seed/generated_token_only_mask"] = 1.0
+        metrics["seed/teacher_active_tokens"] = float(
+            (response_mask & teacher_signal_mask.unsqueeze(-1)).sum().detach().cpu().item()
+        )
 
         if episode_skill_indices:
             module_logger.info(
@@ -3261,6 +3421,16 @@ class RayPPOTrainer:
                                         teacher_signal_batch=teacher_signal_batch,
                                     )
                                 except Exception as exc:
+                                    if (
+                                        str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend") or "")
+                                        == JUNE24_BACKEND
+                                    ):
+                                        # Frozen privileged inputs are a
+                                        # provenance contract.  Missing task
+                                        # identity, coverage, or hash evidence
+                                        # must stop the run rather than turn
+                                        # OPD into an all-zero no-op update.
+                                        raise
                                     if (
                                         str(OmegaConf.select(self.config, "algorithm.seed.analysis_prompt_version") or "")
                                         == "seed_visual"

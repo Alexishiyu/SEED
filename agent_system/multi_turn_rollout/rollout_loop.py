@@ -258,6 +258,7 @@ class TrajectoryCollector:
         data_source: Optional[str] = None,
         max_prompt_length: Optional[int] = None,
         images: Any = None,
+        preformatted: bool = False,
     ) -> Dict:
         """
         Build a prompt sample using the same chat-template path as rollout.
@@ -270,12 +271,17 @@ class TrajectoryCollector:
             "content": obs_content,
             "role": "user",
         }])
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(
-            chat,
-            add_generation_prompt=True,
-            tokenize=False,
-            **apply_chat_template_kwargs
-        )
+        if preformatted:
+            if prompt_images:
+                raise RuntimeError("Preformatted prompts do not support multimodal processing.")
+            prompt_with_chat_template = obs_content
+        else:
+            prompt_with_chat_template = self.tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs
+            )
         row_dict = {}
 
         if prompt_images:
@@ -403,6 +409,7 @@ class TrajectoryCollector:
         meta_info: Optional[Dict] = None,
         max_prompt_length: Optional[int] = None,
         images: Optional[List[Any]] = None,
+        preformatted: bool | List[bool] = False,
     ) -> DataProto:
         """
         Build a batch of text or multimodal prompts. Used for SEED analysis
@@ -412,12 +419,18 @@ class TrajectoryCollector:
         for sample_idx, obs_content in enumerate(obs_contents):
             data_source = None if data_sources is None else data_sources[sample_idx]
             sample_images = None if images is None else images[sample_idx]
+            sample_preformatted = (
+                bool(preformatted[sample_idx])
+                if isinstance(preformatted, (list, tuple, np.ndarray))
+                else bool(preformatted)
+            )
             processed_samples.append(
                 self.build_prompt_sample(
                     obs_content=obs_content,
                     data_source=data_source,
                     max_prompt_length=max_prompt_length,
                     images=sample_images,
+                    preformatted=sample_preformatted,
                 )
             )
         batch = collate_fn(processed_samples)
@@ -469,10 +482,12 @@ class TrajectoryCollector:
         obs_base_texts = obs.get('text_base', None)
         obs_images = obs.get('image', None)
         obs_anchors = obs.get('anchor', None)
+        obs_preformatted = obs.get('preformatted', None)
         obs_text = obs_texts[item] if obs_texts is not None else None
         obs_text_base = obs_base_texts[item] if obs_base_texts is not None else obs_text
         obs_image = obs_images[item] if obs_images is not None else None
         obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        is_preformatted = bool(obs_preformatted[item]) if obs_preformatted is not None else False
         is_multi_modal = obs_image is not None
 
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
@@ -495,13 +510,20 @@ class TrajectoryCollector:
             "role": "user",
         }])
         
-        # Apply chat template
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(
-            chat,
-            add_generation_prompt=True,
-            tokenize=False,
-            **apply_chat_template_kwargs
-        )
+        # BFCL supplies the official Qwen handler prompt.  Passing it through
+        # unchanged prevents a second chat template from nesting it in a user
+        # message and keeps student/teacher response-token alignment exact.
+        if is_preformatted:
+            if is_multi_modal:
+                raise RuntimeError("Preformatted rollout prompts cannot be multimodal.")
+            prompt_with_chat_template = obs_content
+        else:
+            prompt_with_chat_template = self.tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs
+            )
         
         # Initialize return dict
         row_dict = {}
@@ -586,6 +608,12 @@ class TrajectoryCollector:
             'index': item,
             'data_source': data_source
         })
+
+        for metadata_key in ('task_id', 'bfcl_turn_id', 'bfcl_step_in_turn'):
+            metadata_values = obs.get(metadata_key)
+            if metadata_values is not None:
+                row_dict[metadata_key] = metadata_values[item]
+        row_dict['prompt_preformatted'] = is_preformatted
 
         if self.config.data.get('return_raw_chat', False):
             row_dict['raw_prompt'] = chat.tolist()

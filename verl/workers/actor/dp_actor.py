@@ -18,12 +18,15 @@ Single Process Actor
 """
 
 import logging
+import hashlib
 import itertools
+import json
 import math
 import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -53,10 +56,24 @@ elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
 
-__all__ = ["DataParallelPPOActor"]
+__all__ = ["DataParallelPPOActor", "compose_actor_objective"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def compose_actor_objective(
+    *,
+    policy_objective: torch.Tensor,
+    opd_loss: torch.Tensor,
+    opd_loss_coef: float,
+    opd_only: bool,
+) -> torch.Tensor:
+    """Combine objectives while making the OPD-only gradient boundary explicit."""
+
+    if opd_only:
+        return opd_loss * float(opd_loss_coef)
+    return policy_objective + opd_loss * float(opd_loss_coef)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -102,6 +119,24 @@ class DataParallelPPOActor(BasePPOActor):
         if value is None:
             return default
         return float(value)
+
+    def _trainable_parameter_sha256(self) -> str:
+        digest = hashlib.sha256()
+        count = 0
+        for name, parameter in sorted(self.actor_module.named_parameters(), key=lambda item: item[0]):
+            if not parameter.requires_grad:
+                continue
+            tensor = parameter.detach()
+            if hasattr(tensor, "to_local"):
+                tensor = tensor.to_local()
+            tensor = tensor.float().contiguous().cpu()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.numpy().tobytes())
+            count += tensor.numel()
+        if count == 0:
+            raise RuntimeError("actor.opd_only found no trainable parameters")
+        return digest.hexdigest()
 
     @staticmethod
     def _to_text(value: Any) -> str:
@@ -766,15 +801,21 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
         self.global_step = int(data.meta_info.get("global_step", self.global_step) or 0)
-        use_env_aux_loss = self._env_aux_loss_enabled()
+        opd_only = bool(self.config.get("opd_only", False))
+        trainable_sha_before = self._trainable_parameter_sha256() if opd_only else None
+        use_env_aux_loss = False if opd_only else self._env_aux_loss_enabled()
         if use_env_aux_loss and self.config.use_dynamic_bsz:
             raise RuntimeError("SP/ID environment auxiliary loss is not supported with actor.use_dynamic_bsz=True.")
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if not opd_only:
+            select_keys.extend(["old_log_probs", "advantages"])
         opd_loss_coef = float(self.config.get("opd_loss_coef", 0.0) or 0.0)
         skill_gen_loss_coef = float(self.config.get("skill_gen_loss_coef", 0.0) or 0.0)
         seed_skill_gen_payload = data.meta_info.get("seed_skill_gen")
         use_skill_gen_loss = (
+            not opd_only
+            and
             skill_gen_loss_coef > 0
             and isinstance(seed_skill_gen_payload, dict)
             and all(key in seed_skill_gen_payload for key in ("responses", "input_ids", "attention_mask", "position_ids", "rewards"))
@@ -785,6 +826,21 @@ class DataParallelPPOActor(BasePPOActor):
             opd_loss_coef > 0
             and has_teacher_signal
         )
+        if opd_only:
+            forbidden = {
+                "entropy_coeff": float(self.config.get("entropy_coeff", 0.0) or 0.0),
+                "kl_loss_coef": float(self.config.get("kl_loss_coef", 0.0) or 0.0)
+                if self.config.get("use_kl_loss", False)
+                else 0.0,
+                "skill_gen_loss_coef": skill_gen_loss_coef,
+                "sp_coef": float(self.config.get("sp_coef", 0.0) or 0.0),
+                "id_coef": float(self.config.get("id_coef", 0.0) or 0.0),
+            }
+            active_forbidden = {key: value for key, value in forbidden.items() if value != 0.0}
+            if active_forbidden:
+                raise ValueError(f"actor.opd_only forbids auxiliary/RL loss coefficients: {active_forbidden}")
+            if not use_opd_loss:
+                raise RuntimeError("actor.opd_only requires aligned teacher_log_prob and teacher_signal_mask")
         if use_opd_loss:
             select_keys.extend(["teacher_log_prob", teacher_mask_key])
         if multi_turn:
@@ -853,14 +909,14 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
+                    old_log_prob = data.get("old_log_probs")
+                    advantages = data.get("advantages")
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
+                    entropy_coeff = 0.0 if opd_only else self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
@@ -869,33 +925,38 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
                     
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    if loss_mode == "vanilla":
-                        policy_loss_fn = compute_policy_loss
-                    elif loss_mode == "gspo":
-                        policy_loss_fn = compute_policy_loss_gspo
+                    if opd_only:
+                        pg_loss = log_prob.new_tensor(0.0)
+                        pg_clipfrac = log_prob.new_tensor(0.0)
+                        ppo_kl = log_prob.new_tensor(0.0)
+                        pg_clipfrac_lower = log_prob.new_tensor(0.0)
+                        policy_loss = log_prob.new_tensor(0.0)
                     else:
-                        raise ValueError(f"Unsupported loss_mode: {loss_mode}")
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        if loss_mode == "vanilla":
+                            policy_loss_fn = compute_policy_loss
+                        elif loss_mode == "gspo":
+                            policy_loss_fn = compute_policy_loss_gspo
+                        else:
+                            raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
 
                     opd_loss = log_prob.new_tensor(0.0)
                     opd_active_token_ratio = log_prob.new_tensor(0.0)
@@ -917,9 +978,14 @@ class DataParallelPPOActor(BasePPOActor):
                             gate_beta=self.config.get("opd_gate_beta", 5.0),
                             loss_agg_mode=loss_agg_mode,
                         )
-                        policy_loss = policy_loss + opd_loss_coef * opd_loss
+                        policy_loss = compose_actor_objective(
+                            policy_objective=policy_loss,
+                            opd_loss=opd_loss,
+                            opd_loss_coef=opd_loss_coef,
+                            opd_only=opd_only,
+                        )
 
-                    if self.config.use_kl_loss:
+                    if self.config.use_kl_loss and not opd_only:
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
@@ -957,6 +1023,8 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/opd_gate_mean": opd_gate_mean.detach().item(),
                         "actor/opd_gate_active_ratio": opd_gate_active_ratio.detach().item(),
                         "actor/opd_teacher_gap_mean": opd_teacher_gap_mean.detach().item(),
+                        "actor/opd_only": 1.0 if opd_only else 0.0,
+                        "actor/rl_gradient_contribution": 0.0 if opd_only else 1.0,
                         "actor/env_aux_loss": env_aux_loss.detach().item(),
                         "actor/sp_coef": self.sp_coef,
                         "actor/id_coef": self.id_coef,
@@ -978,5 +1046,27 @@ class DataParallelPPOActor(BasePPOActor):
             skill_gen_grad_norm = self._optimizer_step()
             skill_gen_metrics["actor/skill_gen_grad_norm"] = skill_gen_grad_norm.detach().item()
             append_to_dict(metrics, skill_gen_metrics)
+        if opd_only:
+            trainable_sha_after = self._trainable_parameter_sha256()
+            checksum_changed = trainable_sha_before != trainable_sha_after
+            append_to_dict(metrics, {"actor/trainable_checksum_changed": float(checksum_changed)})
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                evidence = {
+                    "global_step": self.global_step,
+                    "trainable_sha256_before": trainable_sha_before,
+                    "trainable_sha256_after": trainable_sha_after,
+                    "changed": checksum_changed,
+                }
+                evidence_path = self.config.get("opd_evidence_path")
+                if evidence_path:
+                    path = Path(str(evidence_path)).expanduser()
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                print(
+                    "SEED_OPD_TRAINABLE_CHECKSUM "
+                    f"before={trainable_sha_before} after={trainable_sha_after} changed={checksum_changed}",
+                    flush=True,
+                )
         self.actor_optimizer.zero_grad()
         return metrics

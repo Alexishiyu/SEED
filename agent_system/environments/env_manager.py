@@ -1117,6 +1117,32 @@ def make_envs(config):
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
     projection_require_think = _projection_requires_think(config)
 
+    if config.env.env_name.lower() == "bfcl":
+        from pathlib import Path
+
+        from agent_system.environments.env_package.bfcl import (
+            BFCLEnvironmentManager,
+            build_bfcl_envs,
+        )
+
+        bfcl_root = Path(str(config.env.bfcl.root)).expanduser().resolve()
+        common = {
+            "bfcl_root": bfcl_root,
+            "model_id": str(config.env.bfcl.model_id),
+            "temperature": float(config.env.bfcl.temperature),
+            "max_steps_per_turn": int(config.env.bfcl.max_steps_per_turn),
+        }
+        _envs = build_bfcl_envs(
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            **common,
+        )
+        _val_envs = build_bfcl_envs(
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            **common,
+        )
+        return BFCLEnvironmentManager(_envs, config), BFCLEnvironmentManager(_val_envs, config)
     if "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)

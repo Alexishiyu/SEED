@@ -6,6 +6,7 @@
 - [3. Sokoban](#3-sokoban)  
 - [4. Gym Cards](#4-gym-cards)  
 - [5. AppWorld (Experimental)](#5-appworld-experimental)  
+- [6. BFCL](#6-bfcl)
 
 ## 1. ALFWorld
 Install with pip:
@@ -99,3 +100,21 @@ pip install git+https://github.com/StonyBrookNLP/appworld.git
 appworld install
 appworld download data
 ```
+
+---
+
+## 6. BFCL
+
+SEED's BFCL adapter uses the official Gorilla/BFCL handler, simulator, and
+multi-turn verifier. The tested checkout is:
+
+```bash
+git clone https://github.com/ShishirPatil/gorilla.git /path/to/gorilla
+git -C /path/to/gorilla checkout f7cf7359b7ac615a0b294831c5ba2bc95ee4a000
+pip install -e /path/to/gorilla/berkeley-function-call-leaderboard
+```
+
+Configure `env.env_name=bfcl` and set `env.bfcl.root` to the
+`berkeley-function-call-leaderboard` directory. BFCL tasks are JSON-encoded in
+`env_kwargs.bfcl_task_json`; this preserves empty nested state such as
+`initial_config={}` through Parquet.

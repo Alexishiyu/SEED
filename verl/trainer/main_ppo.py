@@ -107,10 +107,12 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        opd_only = bool(config.actor_rollout_ref.actor.get("opd_only", False))
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(actor_rollout_cls),
-            Role.Critic: ray.remote(CriticWorker),
         }
+        if not opd_only:
+            role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
 
         global_pool_id = "global_pool"
         resource_pool_spec = {
@@ -118,8 +120,9 @@ class TaskRunner:
         }
         mapping = {
             Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
         }
+        if not opd_only:
+            mapping[Role.Critic] = global_pool_id
 
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score
