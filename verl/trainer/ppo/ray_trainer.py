@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import logging
 import os
+import random
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -893,6 +894,14 @@ class RayPPOTrainer:
     def _set_zero_seed_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
         batch_size = len(batch)
         batch.batch["teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        if self._config_bool(
+            self.config,
+            "algorithm.seed.june24_inline_same_prompt_diagnostics",
+            False,
+        ):
+            batch.batch["control_teacher_log_prob"] = torch.zeros_like(
+                batch.batch["responses"], dtype=torch.float32
+            )
         batch.batch["episode_teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         batch.batch["step_teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         batch.batch["critical_step_mask"] = torch.zeros(
@@ -980,6 +989,7 @@ class RayPPOTrainer:
     ) -> DataProto:
         source_indices = batch.non_tensor_batch.get("_batch_source_idx")
         teacher_log_prob = teacher_signal_batch.batch["teacher_log_prob"]
+        control_teacher_log_prob = teacher_signal_batch.batch.get("control_teacher_log_prob")
         episode_teacher_log_prob = (
             teacher_signal_batch.batch["episode_teacher_log_prob"]
             if "episode_teacher_log_prob" in teacher_signal_batch.batch.keys()
@@ -1008,6 +1018,8 @@ class RayPPOTrainer:
                 device=teacher_log_prob.device,
             )
             teacher_log_prob = teacher_log_prob.index_select(0, gather_idx)
+            if control_teacher_log_prob is not None:
+                control_teacher_log_prob = control_teacher_log_prob.index_select(0, gather_idx)
             episode_teacher_log_prob = episode_teacher_log_prob.index_select(0, gather_idx)
             step_teacher_log_prob = step_teacher_log_prob.index_select(0, gather_idx)
             critical_step_mask = critical_step_mask.index_select(0, gather_idx)
@@ -1015,6 +1027,8 @@ class RayPPOTrainer:
             teacher_signal_mask = teacher_signal_mask.index_select(0, gather_idx)
 
         batch.batch["teacher_log_prob"] = teacher_log_prob
+        if control_teacher_log_prob is not None:
+            batch.batch["control_teacher_log_prob"] = control_teacher_log_prob
         batch.batch["episode_teacher_log_prob"] = episode_teacher_log_prob
         batch.batch["step_teacher_log_prob"] = step_teacher_log_prob
         batch.batch["critical_step_mask"] = critical_step_mask
@@ -1137,6 +1151,15 @@ class RayPPOTrainer:
                     raise ValueError("june24_skill_summary forbids dynamic skill generation")
                 if float(OmegaConf.select(config, "actor_rollout_ref.actor.skill_gen_loss_coef") or 0.0) != 0.0:
                     raise ValueError("june24_skill_summary forbids skill-generation loss")
+                fixed_manifest = OmegaConf.select(config, "algorithm.seed.june24_fixed_manifest")
+                cohort_manifest = OmegaConf.select(config, "algorithm.seed.june24_cohort_manifest")
+                split_manifest = OmegaConf.select(config, "algorithm.seed.june24_split_manifest")
+                if bool(fixed_manifest) == bool(cohort_manifest or split_manifest):
+                    raise ValueError(
+                        "june24_skill_summary requires exactly one authority: fixed manifest or all-200 cohort/split"
+                    )
+                if bool(cohort_manifest) != bool(split_manifest):
+                    raise ValueError("all-200 June 24 mode requires both cohort and split manifests")
                 self._lazy_init_june24_skill_bank()
             if analysis_backend == "policy_vllm" and analysis_enabled:
                 if str(config.actor_rollout_ref.rollout.name) != "vllm":
@@ -1810,6 +1833,8 @@ class RayPPOTrainer:
         data_source_lst = []
         tool_calling_list = []
         traj_uid_list = []
+        validation_task_id_list = []
+        validation_episode_success_list = []
         success_rate_dict = {}
 
         # Lists to collect samples for the table
@@ -1892,6 +1917,27 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
+            validation_task_id_list.append(
+                np.asarray(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "task_id",
+                        [""] * len(test_output_gen_batch),
+                    ),
+                    dtype=object,
+                )
+            )
+            validation_episode_success_list.append(
+                np.asarray(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "episode_success",
+                        test_output_gen_batch.non_tensor_batch.get(
+                            "episode_rewards",
+                            [None] * len(test_output_gen_batch),
+                        ),
+                    ),
+                    dtype=object,
+                )
+            )
             # success rate
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
@@ -1924,6 +1970,8 @@ class RayPPOTrainer:
         unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
         unique_data_sources = data_sources[unique_idx]
         unique_tool_callings = tool_callings[unique_idx]
+        validation_task_ids = np.concatenate(validation_task_id_list, axis=0)[unique_idx]
+        validation_episode_success = np.concatenate(validation_episode_success_list, axis=0)[unique_idx]
 
         for i in range(unique_tool_callings.shape[0]):
             data_source = unique_data_sources[i]
@@ -1942,6 +1990,48 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+
+        validation_data_dir = self.config.trainer.get("validation_data_dir")
+        if validation_data_dir:
+            validation_records = []
+            for output_index, source_index in enumerate(unique_idx):
+                success_value = validation_episode_success[output_index]
+                if success_value is None:
+                    success_value = float(reward_tensor[source_index].item()) > 0.0
+                validation_records.append(
+                    {
+                        "global_step": int(self.global_steps),
+                        "task_id": str(validation_task_ids[output_index]),
+                        "traj_uid": str(unique_traj_uid[output_index]),
+                        "success": bool(float(success_value) >= 1.0),
+                        "reward": float(reward_tensor[source_index].item()),
+                        "tool_call_count": int(unique_tool_callings[output_index]),
+                        "prompt_mode": "ordinary_bfcl",
+                        "privileged_context": False,
+                    }
+                )
+            if str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend") or "") == JUNE24_BACKEND:
+                missing_ids = [record for record in validation_records if not record["task_id"]]
+                if missing_ids:
+                    raise RuntimeError("June 24 BFCL validation lost exact task identity")
+            output_path = Path(str(validation_data_dir)).expanduser() / f"global_step_{self.global_steps:06d}.json"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                _safe_json_dumps(
+                    {
+                        "global_step": int(self.global_steps),
+                        "prompt_mode": "ordinary_bfcl",
+                        "privileged_context": False,
+                        "trajectory_count": len(validation_records),
+                        "success_count": sum(record["success"] for record in validation_records),
+                        "records": validation_records,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         subtask_success_rate_mean = compute_subtask_success_rate_mean(success_rate)
         if subtask_success_rate_mean is not None:
@@ -2082,10 +2172,11 @@ class RayPPOTrainer:
         if self._june24_skill_bank is None:
             skill_bank = OmegaConf.select(self.config, "algorithm.seed.june24_skill_bank")
             fixed_manifest = OmegaConf.select(self.config, "algorithm.seed.june24_fixed_manifest")
-            if not skill_bank or not fixed_manifest:
+            cohort_manifest = OmegaConf.select(self.config, "algorithm.seed.june24_cohort_manifest")
+            split_manifest = OmegaConf.select(self.config, "algorithm.seed.june24_split_manifest")
+            if not skill_bank:
                 raise ValueError(
-                    "june24_skill_summary requires algorithm.seed.june24_skill_bank and "
-                    "algorithm.seed.june24_fixed_manifest"
+                    "june24_skill_summary requires algorithm.seed.june24_skill_bank"
                 )
             verify_sources = self._config_bool(
                 self.config,
@@ -2094,14 +2185,18 @@ class RayPPOTrainer:
             )
             self._june24_skill_bank = load_june24_skill_bank(
                 Path(str(skill_bank)),
-                fixed_manifest=Path(str(fixed_manifest)),
+                fixed_manifest=Path(str(fixed_manifest)) if fixed_manifest else None,
+                cohort_manifest=Path(str(cohort_manifest)) if cohort_manifest else None,
+                split_manifest=Path(str(split_manifest)) if split_manifest else None,
                 required_task_ids=self._get_june24_task_ids(),
                 verify_source_files=verify_sources,
             )
             module_logger.info(
-                "Loaded frozen June 24 skill bank sha256=%s fixed_manifest_sha256=%s tasks=%s",
+                "Loaded frozen June 24 skill bank sha256=%s authority_sha256=%s split_sha256=%s tasks=%s",
                 self._june24_skill_bank.sha256,
-                self._june24_skill_bank.fixed_manifest_sha256,
+                self._june24_skill_bank.fixed_manifest_sha256
+                or self._june24_skill_bank.cohort_manifest_sha256,
+                self._june24_skill_bank.split_manifest_sha256,
                 len(self._june24_skill_bank.records),
             )
         return self._june24_skill_bank
@@ -2473,6 +2568,11 @@ class RayPPOTrainer:
         batch_size = len(batch)
         response_mask = compute_response_mask(batch)
         zero_teacher_log_prob = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        inline_control_requested = self._config_bool(
+            self.config,
+            "algorithm.seed.june24_inline_same_prompt_diagnostics",
+            False,
+        )
         zero_critical_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
         zero_step_skill_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
         batch.batch["teacher_signal_mask"] = zero_critical_mask.clone()
@@ -2486,6 +2586,8 @@ class RayPPOTrainer:
                 num_trajectories,
             )
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            if inline_control_requested:
+                batch.batch["control_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
@@ -2526,6 +2628,8 @@ class RayPPOTrainer:
         if "obs_text" not in batch.non_tensor_batch:
             module_logger.warning("SEED teacher signal skipped because obs_text is missing from the rollout batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            if inline_control_requested:
+                batch.batch["control_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
@@ -2716,6 +2820,8 @@ class RayPPOTrainer:
 
         if not teacher_enabled:
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            if inline_control_requested:
+                batch.batch["control_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = critical_mask
@@ -2740,6 +2846,8 @@ class RayPPOTrainer:
         if len(critical_indices) == 0:
             module_logger.info("SEED has no episode-level OPD steps for the current batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+            if inline_control_requested:
+                batch.batch["control_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_skill_mask"] = zero_step_skill_mask
@@ -2747,6 +2855,7 @@ class RayPPOTrainer:
             return batch
 
         episode_obs_texts = []
+        episode_control_obs_texts = []
         episode_data_sources = []
         episode_prompt_images = []
         episode_skill_indices = []
@@ -2822,6 +2931,12 @@ class RayPPOTrainer:
                             task_id,
                             analysis["june24_summary"],
                         )
+                    if self._config_bool(
+                        self.config,
+                        "algorithm.seed.june24_inline_same_prompt_diagnostics",
+                        False,
+                    ):
+                        episode_control_obs_texts.append(observation_text)
                 else:
                     episode_enhanced_obs = build_augmented_observation_text(
                         observation=observation_text,
@@ -2975,6 +3090,7 @@ class RayPPOTrainer:
             return teacher_log_prob.batch["old_log_probs"]
 
         full_episode_teacher_log_prob = zero_teacher_log_prob.clone()
+        full_control_teacher_log_prob = zero_teacher_log_prob.clone()
         episode_skill_mask_np = np.zeros(batch_size, dtype=bool)
         active_teacher_log_prob_chunks = []
         metrics["seed/teacher_log_prob_mean"] = 0.0
@@ -2999,6 +3115,21 @@ class RayPPOTrainer:
             metrics["seed/episode_skill_teacher_log_prob_mean"] = float(
                 episode_teacher_lp.mean().detach().cpu().item()
             )
+            if episode_control_obs_texts:
+                if len(episode_control_obs_texts) != len(episode_skill_indices):
+                    raise RuntimeError("June 24 inline control prompt count does not align with teacher rows")
+                episode_control_lp = _compute_skill_log_probs(
+                    label="ordinary-prompt-control",
+                    obs_texts=episode_control_obs_texts,
+                    responses=batch.batch["responses"].index_select(0, episode_skill_tensor_indices),
+                    response_masks=response_mask.index_select(0, episode_skill_tensor_indices),
+                    data_sources=episode_data_sources,
+                    prompt_images=episode_prompt_images,
+                )
+                full_control_teacher_log_prob[episode_skill_indices] = episode_control_lp
+                metrics["seed/control_teacher_log_prob_mean"] = float(
+                    episode_control_lp.mean().detach().cpu().item()
+                )
         full_step_teacher_log_prob = zero_teacher_log_prob.clone()
         step_skill_mask_np = np.zeros(batch_size, dtype=bool)
         metrics["seed/step_skill_teacher_log_prob_mean"] = 0.0
@@ -3042,6 +3173,8 @@ class RayPPOTrainer:
             )
 
         batch.batch["teacher_log_prob"] = full_teacher_log_prob
+        if inline_control_requested:
+            batch.batch["control_teacher_log_prob"] = full_control_teacher_log_prob
         batch.batch["episode_teacher_log_prob"] = full_episode_teacher_log_prob
         batch.batch["step_teacher_log_prob"] = full_step_teacher_log_prob
         batch.batch["critical_step_mask"] = episode_skill_mask
@@ -3049,8 +3182,15 @@ class RayPPOTrainer:
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
         metrics["seed/teacher_student_token_alignment"] = 1.0
         metrics["seed/generated_token_only_mask"] = 1.0
+        inline_control_enabled = bool(episode_control_obs_texts)
+        metrics["seed/inline_same_prompt_diagnostics"] = 1.0 if inline_control_enabled else 0.0
+        metrics["seed/control_teacher_student_token_alignment"] = 1.0 if inline_control_enabled else 0.0
+        metrics["seed/control_generated_token_only_mask"] = 1.0 if inline_control_enabled else 0.0
         metrics["seed/teacher_active_tokens"] = float(
             (response_mask & teacher_signal_mask.unsqueeze(-1)).sum().detach().cpu().item()
+        )
+        metrics["seed/control_teacher_active_tokens"] = (
+            metrics["seed/teacher_active_tokens"] if inline_control_enabled else 0.0
         )
 
         if episode_skill_indices:
@@ -3095,7 +3235,21 @@ class RayPPOTrainer:
         # save dataloader
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        driver_rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            driver_rng_state["cuda"] = torch.cuda.get_rng_state_all()
+        torch.save(
+            {
+                "schema_version": "seed.stateful_dataloader_and_driver_rng.v1",
+                "dataloader": dataloader_state_dict,
+                "driver_rng": driver_rng_state,
+            },
+            dataloader_local_path,
+        )
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
@@ -3148,7 +3302,23 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            saved_data_state = torch.load(dataloader_local_path, weights_only=False)
+            if (
+                isinstance(saved_data_state, dict)
+                and saved_data_state.get("schema_version")
+                == "seed.stateful_dataloader_and_driver_rng.v1"
+            ):
+                dataloader_state_dict = saved_data_state["dataloader"]
+                driver_rng_state = saved_data_state["driver_rng"]
+                random.setstate(driver_rng_state["python"])
+                np.random.set_state(driver_rng_state["numpy"])
+                torch.set_rng_state(driver_rng_state["torch"])
+                if torch.cuda.is_available() and "cuda" in driver_rng_state:
+                    torch.cuda.set_rng_state_all(driver_rng_state["cuda"])
+            else:
+                # Backward compatibility with upstream checkpoints that stored
+                # only the StatefulDataLoader payload.
+                dataloader_state_dict = saved_data_state
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -3531,6 +3701,39 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
+                            if (
+                                str(OmegaConf.select(self.config, "algorithm.seed.analysis_backend") or "")
+                                == JUNE24_BACKEND
+                            ):
+                                bank = self._lazy_init_june24_skill_bank()
+                                task_ids = [str(value) for value in batch.non_tensor_batch.get("task_id", [])]
+                                if len(task_ids) != len(batch):
+                                    raise RuntimeError("June 24 OPD actor batch lost exact BFCL task ids")
+                                outcome_map = bank.outcome_class_by_task_id or {}
+                                outcome_classes = [outcome_map.get(task_id) for task_id in task_ids]
+                                if any(value is None for value in outcome_classes):
+                                    raise RuntimeError("June 24 OPD actor batch has an unaudited outcome class")
+                                if set(task_ids) & set(bank.validation_task_ids):
+                                    raise RuntimeError("held-out BFCL validation task leaked into OPD training")
+                                if bank.split_manifest_path is not None and len(set(task_ids)) != 4:
+                                    raise RuntimeError(
+                                        "canonical all-200 OPD update must contain exactly four task trajectories"
+                                    )
+                                class_to_id = {
+                                    "fixed": 0,
+                                    "both_wrong": 1,
+                                    "harmed": 2,
+                                    "both_correct": 3,
+                                }
+                                batch.non_tensor_batch["june24_outcome_class"] = np.asarray(
+                                    outcome_classes,
+                                    dtype=object,
+                                )
+                                batch.batch["june24_outcome_class_id"] = torch.as_tensor(
+                                    [class_to_id[value] for value in outcome_classes],
+                                    dtype=torch.long,
+                                    device=batch.batch["responses"].device,
+                                )
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             batch.meta_info["global_step"] = self.global_steps
                             actor_output = self.actor_rollout_wg.update_actor(batch)

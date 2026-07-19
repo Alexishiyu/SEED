@@ -33,3 +33,34 @@ def test_async_teacher_snapshot_preserves_exact_bfcl_identity():
 
     batch.non_tensor_batch["task_id"][0] = "mutated"
     assert snapshot.non_tensor_batch["task_id"][0] == "multi_turn_base_16"
+
+
+def test_async_merge_preserves_inline_same_prompt_control_alignment():
+    batch = DataProto.from_dict(
+        tensors={"responses": torch.tensor([[1, 2], [3, 4]])},
+        non_tensors={"_batch_source_idx": np.asarray([1, 0], dtype=np.int64)},
+    )
+    teacher = DataProto.from_dict(
+        tensors={
+            "teacher_log_prob": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+            "control_teacher_log_prob": torch.tensor([[1.1, 1.2], [1.3, 1.4]]),
+            "episode_teacher_log_prob": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+            "step_teacher_log_prob": torch.zeros((2, 2)),
+            "critical_step_mask": torch.tensor([True, True]),
+            "step_skill_mask": torch.tensor([False, False]),
+            "teacher_signal_mask": torch.tensor([True, True]),
+        },
+    )
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer._build_seed_skill_gen_payload = lambda **_: None
+
+    merged = trainer._merge_async_seed_teacher_signals(batch, teacher)
+
+    torch.testing.assert_close(
+        merged.batch["teacher_log_prob"],
+        torch.tensor([[0.3, 0.4], [0.1, 0.2]]),
+    )
+    torch.testing.assert_close(
+        merged.batch["control_teacher_log_prob"],
+        torch.tensor([[1.3, 1.4], [1.1, 1.2]]),
+    )

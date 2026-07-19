@@ -58,6 +58,7 @@ actor_rollout_ref:
     opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating
     opd_only: False # optimize only the unchanged OPD objective; excludes PG, entropy, KL, reward, critic, and auxiliary losses
     opd_evidence_path: null # optional rank-0 JSON path for before/after trainable-parameter SHA-256
+    opd_diagnostics_path: null # optional rank-0 directory containing one exact-token diagnostic JSON per optimizer update
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -86,12 +87,17 @@ actor_rollout_ref:
     checkpoint:
       contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
     optim:
+      name: adamw # adam / adamw; existing recipes retain AdamW
       lr: 1e-6
+      betas: [0.9, 0.999]
+      eps: 1e-8
       lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
       min_lr_ratio: 0.0   # only used with cosine lr scheduler, default to 0.0
       num_cycles: 0.5     # only used with cosine lr scheduler, default to 0.5
-      warmup_style: constant  # select from constant/cosine
+      warmup_style: constant  # constant / cosine / two_stage_linear
+      warmup_target_lr: null # required for two_stage_linear
+      final_lr: null # required for two_stage_linear
       total_training_steps: -1  # must be override by program
       weight_decay: 0.01
     fsdp_config:
@@ -288,8 +294,11 @@ algorithm:
     analysis_backend: "openai"
     june24_skill_bank: null # required only for analysis_backend=june24_skill_summary
     june24_fixed_manifest: null # corrected fixed-40 cohort authority
+    june24_cohort_manifest: null # audited all-200 cohort authority
+    june24_split_manifest: null # deterministic stratified 160/40 split
     june24_task_ids: null # comma-separated selected fixed-40 ids; coverage is validated before rollout
     june24_same_prompt_control: False # re-score under the ordinary prompt for the paired K3 control
+    june24_inline_same_prompt_diagnostics: False # additionally score the exact sampled tokens under the ordinary prompt without optimizing that signal
     june24_verify_source_files: True # recompute every historical source-call SHA-256 before rollout
     analysis_prompt_version: "seed" # "seed" uses original SEED; "seed_visual" uses the SEED prompt format with image observations
     analysis_num_workers: 8

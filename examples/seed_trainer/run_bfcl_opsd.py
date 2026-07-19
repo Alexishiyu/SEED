@@ -1,4 +1,4 @@
-"""Plan and launch June 24 Skill-SD OPD-only training on official BFCL tasks."""
+"""Plan and launch frozen June 24 OPD-only training on official BFCL tasks."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from agent_system.environments.env_package.bfcl.envs import (
     BFCLWorker,
@@ -18,8 +18,10 @@ from agent_system.environments.env_package.bfcl.envs import (
 from seed.june24_skill_summary import (
     load_skill_bank,
     sha256_file,
+    validate_all200_cohort_manifest,
     validate_context_lengths,
     validate_fixed_manifest,
+    validate_stratified_split_manifest,
 )
 
 
@@ -34,6 +36,13 @@ def _git_sha(root: Path) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _read_json(path: Path) -> Mapping[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise ValueError(f"expected a JSON object: {path}")
+    return value
 
 
 def _parse_task_ids(value: str | None, fixed_ids: list[str]) -> list[str]:
@@ -65,9 +74,9 @@ def _official_tasks_and_prompts(
     bfcl_root: Path,
     model: str,
     task_ids: Iterable[str],
-) -> tuple[list[dict[str, Any]], dict[str, str]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     components = load_bfcl_components(bfcl_root)
-    tasks = []
+    tasks: dict[str, dict[str, Any]] = {}
     prompts: dict[str, str] = {}
     for task_id in task_ids:
         task = hydrate_task(components, {"id": task_id})
@@ -80,43 +89,79 @@ def _official_tasks_and_prompts(
         prompt, info = worker.reset({"bfcl_task": task})
         if info["task_id"] != task_id:
             raise RuntimeError(f"official BFCL reset changed task id {task_id} to {info['task_id']}")
-        tasks.append(task)
+        tasks[task_id] = task
         prompts[task_id] = prompt
     return tasks, prompts
 
 
-def _write_dataset(path: Path, tasks: list[dict[str, Any]]) -> None:
-    import pandas as pd
-
+def _dataset_rows(
+    *,
+    tasks: Mapping[str, dict[str, Any]],
+    scheduled_task_ids: Iterable[str],
+    split: str,
+    classification_by_id: Mapping[str, str],
+    iteration: int | None = None,
+) -> list[dict[str, Any]]:
     rows = []
-    for index, task in enumerate(tasks):
-        task_id = str(task["id"])
+    for index, task_id in enumerate(scheduled_task_ids):
+        task = tasks[task_id]
         rows.append(
             {
                 "data_source": "bfcl",
                 "prompt": [{"role": "user", "content": ""}],
                 "ability": "official_bfcl_multi_turn",
                 "reward_model": {"style": "rule", "ground_truth": ""},
-                "extra_info": {"index": index, "task_id": task_id},
-                # JSON encoding is intentional: PyArrow must preserve empty
-                # nested state such as initial_config={} without inferring an
-                # unsupported empty struct.
+                "extra_info": {
+                    "index": index,
+                    "task_id": task_id,
+                    "split": split,
+                    "outcome_class": classification_by_id.get(task_id),
+                    "iteration": iteration,
+                },
+                # JSON encoding preserves empty nested state without asking
+                # PyArrow to infer an unsupported empty struct.
                 "env_kwargs": {
                     "bfcl_task_json": json.dumps(task, ensure_ascii=True, separators=(",", ":")),
                     "task_id": task_id,
                 },
             }
         )
+    return rows
+
+
+def _write_or_validate_dataset(path: Path, rows: list[dict[str, Any]]) -> None:
+    import pandas as pd
+
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        existing = pd.read_parquet(path)
+        expected_ids = [row["extra_info"]["task_id"] for row in rows]
+        observed_ids = [str(value.get("task_id")) for value in existing["extra_info"].tolist()]
+        if observed_ids != expected_ids:
+            raise ValueError(f"existing dataset does not match frozen schedule: {path}")
+        return
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
-def _hydra_command(args: argparse.Namespace, task_ids: list[str], train_path: Path) -> list[str]:
+def _classification_map(cohort_value: Mapping[str, Any]) -> dict[str, str]:
+    records = validate_all200_cohort_manifest(cohort_value)
+    return {record["task_id"]: record["classification"] for record in records}
+
+
+def _hydra_command(
+    args: argparse.Namespace,
+    *,
+    task_ids: list[str],
+    train_path: Path,
+    validation_path: Path,
+    total_updates: int,
+    updates_per_iteration: int,
+) -> list[str]:
     total_model_len = args.max_prompt_length + args.max_response_length
     checkpoint_root = args.run_root / "checkpoints" / args.arm
     evidence_root = args.run_root / "evidence" / args.arm
     task_csv = ",".join(task_ids)
-    return [
+    command = [
         sys.executable,
         "-m",
         "verl.trainer.main_ppo",
@@ -132,13 +177,13 @@ def _hydra_command(args: argparse.Namespace, task_ids: list[str], train_path: Pa
         "algorithm.seed.failed_only=False",
         "algorithm.seed.analysis_backend=june24_skill_summary",
         f"algorithm.seed.june24_skill_bank={args.june24_skill_bank}",
-        f"algorithm.seed.june24_fixed_manifest={args.fixed_manifest}",
         f"algorithm.seed.june24_task_ids='{task_csv}'",
         f"algorithm.seed.june24_same_prompt_control={str(args.same_prompt_control)}",
+        f"algorithm.seed.june24_inline_same_prompt_diagnostics={str(args.inline_same_prompt_diagnostics)}",
         "algorithm.seed.june24_verify_source_files=True",
         "algorithm.seed.skill_gen.enable=False",
         f"data.train_files={train_path}",
-        f"data.val_files={train_path}",
+        f"data.val_files={validation_path}",
         f"data.train_batch_size={args.batch_size}",
         f"data.val_batch_size={args.batch_size}",
         f"data.max_prompt_length={args.max_prompt_length}",
@@ -157,7 +202,12 @@ def _hydra_command(args: argparse.Namespace, task_ids: list[str], train_path: Pa
         f"actor_rollout_ref.actor.ppo_mini_batch_size={args.batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.actor.ppo_epochs=1",
-        f"actor_rollout_ref.actor.optim.lr={args.learning_rate}",
+        "actor_rollout_ref.actor.loss_agg_mode=token-mean",
+        f"actor_rollout_ref.actor.optim.name={args.optimizer}",
+        f"actor_rollout_ref.actor.optim.lr={args.final_lr}",
+        "actor_rollout_ref.actor.optim.betas=[0.9,0.999]",
+        "actor_rollout_ref.actor.optim.eps=1e-8",
+        f"actor_rollout_ref.actor.optim.weight_decay={args.weight_decay}",
         "actor_rollout_ref.actor.entropy_coeff=0.0",
         "actor_rollout_ref.actor.use_invalid_action_penalty=False",
         "actor_rollout_ref.actor.use_kl_loss=False",
@@ -168,6 +218,7 @@ def _hydra_command(args: argparse.Namespace, task_ids: list[str], train_path: Pa
         "actor_rollout_ref.actor.opd_loss_coef=1.0",
         "actor_rollout_ref.actor.opd_gate_beta=5.0",
         f"actor_rollout_ref.actor.opd_evidence_path={evidence_root / 'trainable_checksum.json'}",
+        f"actor_rollout_ref.actor.opd_diagnostics_path={evidence_root / 'updates'}",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={total_model_len}",
         "actor_rollout_ref.actor.use_torch_compile=False",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
@@ -196,117 +247,310 @@ def _hydra_command(args: argparse.Namespace, task_ids: list[str], train_path: Pa
         f"trainer.experiment_name={args.arm}",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
-        "trainer.val_before_train=False",
-        "trainer.test_freq=-1",
-        "trainer.save_freq=1",
+        "trainer.balance_batch=False",
+        f"trainer.save_freq={updates_per_iteration}",
         "trainer.total_epochs=1",
-        f"trainer.total_training_steps={args.updates}",
-        "trainer.resume_mode=disable",
+        f"trainer.total_training_steps={total_updates}",
+        f"trainer.resume_mode={args.resume}",
         f"trainer.default_local_dir={checkpoint_root}",
         f"trainer.rollout_data_dir={evidence_root / 'rollouts'}",
+        f"trainer.validation_data_dir={evidence_root / 'validation'}",
     ]
+    if args.fixed_manifest:
+        command.extend(
+            [
+                f"algorithm.seed.june24_fixed_manifest={args.fixed_manifest}",
+                "trainer.val_before_train=False",
+                "trainer.test_freq=-1",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                f"algorithm.seed.june24_cohort_manifest={args.cohort_manifest}",
+                f"algorithm.seed.june24_split_manifest={args.split_manifest}",
+                f"actor_rollout_ref.actor.optim.lr_warmup_steps={args.warmup_updates}",
+                "actor_rollout_ref.actor.optim.warmup_style=two_stage_linear",
+                f"actor_rollout_ref.actor.optim.warmup_target_lr={args.warmup_target_lr}",
+                f"actor_rollout_ref.actor.optim.final_lr={args.final_lr}",
+                "trainer.val_before_train=True",
+                f"trainer.test_freq={updates_per_iteration}",
+                "trainer.max_actor_ckpt_to_keep=5",
+            ]
+        )
+    return command
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--june24-skill-bank", type=Path, required=True)
-    parser.add_argument("--fixed-manifest", type=Path, required=True)
-    parser.add_argument("--task-ids", default=None)
+    authority = parser.add_mutually_exclusive_group(required=True)
+    authority.add_argument("--fixed-manifest", type=Path)
+    authority.add_argument("--cohort-manifest", type=Path)
+    parser.add_argument("--split-manifest", type=Path)
+    parser.add_argument("--task-ids", default=None, help="Legacy fixed-40 smoke selection only")
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--bfcl-root", type=Path, required=True)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--updates", type=int, default=1)
+    parser.add_argument("--updates", type=int, default=1, help="Legacy fixed-40 smoke updates")
+    parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--optimizer", choices=("adam", "adamw"), default=None)
+    parser.add_argument("--warmup-updates", type=int, default=67)
+    parser.add_argument("--warmup-target-lr", type=float, default=1e-7)
+    parser.add_argument("--final-lr", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=None, help="Legacy fixed-40 alias for --final-lr")
     parser.add_argument("--max-prompt-length", type=int, default=16384)
     parser.add_argument("--max-response-length", type=int, default=2048)
+    parser.add_argument("--resume", choices=("disable", "auto"), default=None)
     parser.add_argument("--rlpaper-sha", default=os.environ.get("RLPAPER_SHA"))
     parser.add_argument("--same-prompt-control", action="store_true")
+    parser.add_argument("--inline-same-prompt-diagnostics", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     args.arm = "same_prompt_control" if args.same_prompt_control else "privileged_june24"
     return args
 
 
+def _resolve_paths(args: argparse.Namespace) -> None:
+    for name in (
+        "june24_skill_bank",
+        "fixed_manifest",
+        "cohort_manifest",
+        "split_manifest",
+        "run_root",
+        "bfcl_root",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(args, name, value.expanduser().resolve())
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
-    args.june24_skill_bank = args.june24_skill_bank.expanduser().resolve()
-    args.fixed_manifest = args.fixed_manifest.expanduser().resolve()
-    args.run_root = args.run_root.expanduser().resolve()
-    args.bfcl_root = args.bfcl_root.expanduser().resolve()
+    _resolve_paths(args)
     if not args.rlpaper_sha:
         raise ValueError("--rlpaper-sha is required for provenance")
-    if args.updates != 1:
-        raise ValueError("the initial smoke contract requires exactly one optimizer update")
 
-    fixed_value = json.loads(args.fixed_manifest.read_text(encoding="utf-8"))
-    fixed_ids = validate_fixed_manifest(fixed_value)
-    task_ids = _parse_task_ids(args.task_ids, fixed_ids)
-    if args.batch_size != len(task_ids):
-        raise ValueError(
-            f"one rollout per task requires --batch-size={len(task_ids)}, got {args.batch_size}"
+    all200_mode = args.cohort_manifest is not None
+    if all200_mode:
+        if args.split_manifest is None:
+            raise ValueError("--cohort-manifest requires --split-manifest")
+        if args.task_ids is not None or args.same_prompt_control:
+            raise ValueError("all-200 mode forbids legacy --task-ids and separate same-prompt-control arms")
+        if args.iterations != 5 or args.batch_size != 4:
+            raise ValueError("the canonical all-200 run requires --iterations=5 and --batch-size=4")
+        if args.updates != 1:
+            raise ValueError("--updates is a legacy fixed-40 option and must remain 1 in all-200 mode")
+        if args.learning_rate is not None:
+            raise ValueError("all-200 mode uses --warmup-target-lr and --final-lr, not --learning-rate")
+        args.optimizer = args.optimizer or "adam"
+        args.weight_decay = 0.0
+        args.resume = args.resume or "auto"
+        if args.optimizer != "adam" or args.weight_decay != 0.0:
+            raise ValueError("the canonical all-200 run requires strict Adam with zero weight decay")
+        if not args.inline_same_prompt_diagnostics:
+            raise ValueError("the canonical all-200 run requires --inline-same-prompt-diagnostics")
+
+        cohort_value = _read_json(args.cohort_manifest)
+        split_value = _read_json(args.split_manifest)
+        classification_by_id = _classification_map(cohort_value)
+        train_ids, validation_ids, schedules = validate_stratified_split_manifest(
+            split_value,
+            cohort_manifest=args.cohort_manifest,
         )
-    bank = load_skill_bank(
-        args.june24_skill_bank,
-        fixed_manifest=args.fixed_manifest,
-        required_task_ids=task_ids,
-        verify_source_files=True,
-    )
-    tasks, student_prompts = _official_tasks_and_prompts(
-        bfcl_root=args.bfcl_root,
-        model=args.model,
-        task_ids=task_ids,
-    )
+        schedule_value = split_value["training_schedule"]
+        total_updates = int(schedule_value["total_updates"])
+        updates_per_iteration = int(schedule_value["updates_per_iteration"])
+        if total_updates != 200 or updates_per_iteration != 40:
+            raise ValueError("canonical all-200 training schedule must contain 200 updates in five groups of 40")
+        bank = load_skill_bank(
+            args.june24_skill_bank,
+            cohort_manifest=args.cohort_manifest,
+            split_manifest=args.split_manifest,
+            required_task_ids=train_ids,
+            verify_source_files=True,
+        )
+        unique_task_ids = train_ids + validation_ids
+        tasks, student_prompts = _official_tasks_and_prompts(
+            bfcl_root=args.bfcl_root,
+            model=args.model,
+            task_ids=unique_task_ids,
+        )
+        scheduled_train_ids = [
+            task_id
+            for schedule in schedules
+            for task_id in schedule["task_ids"]
+        ]
+        train_rows = []
+        offset = 0
+        for schedule in schedules:
+            iteration_rows = _dataset_rows(
+                tasks=tasks,
+                scheduled_task_ids=schedule["task_ids"],
+                split="train",
+                classification_by_id=classification_by_id,
+                iteration=int(schedule["iteration"]),
+            )
+            for row_index, row in enumerate(iteration_rows, start=offset):
+                row["extra_info"]["index"] = row_index
+            offset += len(iteration_rows)
+            train_rows.extend(iteration_rows)
+        validation_rows = _dataset_rows(
+            tasks=tasks,
+            scheduled_task_ids=validation_ids,
+            split="validation",
+            classification_by_id=classification_by_id,
+        )
+        prompt_task_ids = train_ids
+        manifest_provenance = {
+            "cohort_manifest_path": str(args.cohort_manifest),
+            "cohort_manifest_sha256": sha256_file(args.cohort_manifest),
+            "split_manifest_path": str(args.split_manifest),
+            "split_manifest_sha256": sha256_file(args.split_manifest),
+        }
+    else:
+        if args.split_manifest is not None:
+            raise ValueError("--split-manifest is valid only with --cohort-manifest")
+        if args.updates != 1:
+            raise ValueError("the fixed-40 smoke contract requires exactly one optimizer update")
+        args.optimizer = args.optimizer or "adamw"
+        args.weight_decay = 0.01
+        args.resume = args.resume or "disable"
+        if args.learning_rate is not None:
+            args.final_lr = args.learning_rate
+        fixed_value = _read_json(args.fixed_manifest)
+        fixed_ids = validate_fixed_manifest(fixed_value)
+        train_ids = _parse_task_ids(args.task_ids, fixed_ids)
+        validation_ids = list(train_ids)
+        if args.batch_size != len(train_ids):
+            raise ValueError(
+                f"one rollout per task requires --batch-size={len(train_ids)}, got {args.batch_size}"
+            )
+        bank = load_skill_bank(
+            args.june24_skill_bank,
+            fixed_manifest=args.fixed_manifest,
+            required_task_ids=train_ids,
+            verify_source_files=True,
+        )
+        tasks, student_prompts = _official_tasks_and_prompts(
+            bfcl_root=args.bfcl_root,
+            model=args.model,
+            task_ids=train_ids,
+        )
+        classification_by_id = {task_id: "fixed" for task_id in train_ids}
+        train_rows = _dataset_rows(
+            tasks=tasks,
+            scheduled_task_ids=train_ids,
+            split="train",
+            classification_by_id=classification_by_id,
+            iteration=1,
+        )
+        validation_rows = list(train_rows)
+        scheduled_train_ids = list(train_ids)
+        total_updates = 1
+        updates_per_iteration = 1
+        prompt_task_ids = train_ids
+        manifest_provenance = {
+            "fixed_manifest_path": str(args.fixed_manifest),
+            "fixed_manifest_sha256": bank.fixed_manifest_sha256,
+        }
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     prompt_lengths = validate_context_lengths(
         tokenizer=tokenizer,
         bank=bank,
-        student_prompts=student_prompts,
+        student_prompts={task_id: student_prompts[task_id] for task_id in prompt_task_ids},
         max_prompt_length=args.max_prompt_length,
     )
 
     args.run_root.mkdir(parents=True, exist_ok=True)
-    train_path = args.run_root / "inputs" / "bfcl_fixed4.parquet"
-    _write_dataset(train_path, tasks)
-    command = _hydra_command(args, task_ids, train_path)
+    train_path = args.run_root / "inputs" / ("bfcl_train160_x5.parquet" if all200_mode else "bfcl_fixed4.parquet")
+    validation_path = args.run_root / "inputs" / ("bfcl_validation40.parquet" if all200_mode else "bfcl_fixed4.parquet")
+    _write_or_validate_dataset(train_path, train_rows)
+    if validation_path != train_path:
+        _write_or_validate_dataset(validation_path, validation_rows)
+    command = _hydra_command(
+        args,
+        task_ids=train_ids,
+        train_path=train_path,
+        validation_path=validation_path,
+        total_updates=total_updates,
+        updates_per_iteration=updates_per_iteration,
+    )
+    bank_value = _read_json(args.june24_skill_bank)
+    source_calls = bank_value.get("source_calls") or [
+        {
+            "task_id": task_id,
+            "path": bank.summary(task_id)["source_call_path"],
+            "sha256": bank.summary(task_id)["source_call_sha256"],
+        }
+        for task_id in train_ids
+    ]
     provenance = {
         "status": "preflight-only",
+        "mode": "june24_all200_train160_val40" if all200_mode else "june24_fixed40_smoke",
         "arm": args.arm,
         "seed_sha": _git_sha(repo_root),
         "rlpaper_sha": args.rlpaper_sha,
         "bfcl_sha": _git_sha(args.bfcl_root.parent),
         "model": args.model,
-        "task_ids": task_ids,
+        "task_ids": train_ids,
+        "train_task_ids": train_ids,
+        "validation_task_ids": validation_ids,
+        "scheduled_train_task_ids": scheduled_train_ids,
+        "iterations": args.iterations if all200_mode else 1,
+        "batch_size": args.batch_size,
+        "updates_per_iteration": updates_per_iteration,
+        "total_updates": total_updates,
+        "training_rollouts": len(train_rows),
+        "validation_rollouts": (args.iterations + 1) * len(validation_ids) if all200_mode else 0,
         "skill_bank_path": str(args.june24_skill_bank),
         "skill_bank_sha256": bank.sha256,
-        "fixed_manifest_path": str(args.fixed_manifest),
-        "fixed_manifest_sha256": bank.fixed_manifest_sha256,
-        "source_calls": [
-            {
-                "task_id": task_id,
-                "path": bank.summary(task_id)["source_call_path"],
-                "sha256": bank.summary(task_id)["source_call_sha256"],
-            }
-            for task_id in task_ids
-        ],
+        **manifest_provenance,
+        "source_calls": source_calls,
+        "train_dataset_path": str(train_path),
+        "train_dataset_sha256": sha256_file(train_path),
         "dataset_path": str(train_path),
         "dataset_sha256": sha256_file(train_path),
+        "validation_dataset_path": str(validation_path),
+        "validation_dataset_sha256": sha256_file(validation_path),
         "prompt_lengths": prompt_lengths,
+        "optimizer": {
+            "name": args.optimizer,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+            "weight_decay": args.weight_decay,
+        },
+        "learning_rate": {
+            "style": "two_stage_linear" if all200_mode else "constant",
+            "warmup_updates": args.warmup_updates if all200_mode else 0,
+            "warmup_target_lr": args.warmup_target_lr if all200_mode else None,
+            "final_lr": args.final_lr,
+        },
+        "checkpoints": [
+            updates_per_iteration * iteration
+            for iteration in range(1, (args.iterations if all200_mode else 1) + 1)
+        ],
+        "validation_steps": [0, 40, 80, 120, 160, 200] if all200_mode else [],
         "opd": {"only": True, "loss_coef": 1.0, "gate_beta": 5.0},
+        "inline_same_prompt_diagnostics": args.inline_same_prompt_diagnostics,
         "external_analysis_calls": False,
         "dynamic_hindsight_analysis": False,
         "same_prompt_control": args.same_prompt_control,
+        "resume_mode": args.resume,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
     _write_json(metadata_path, provenance)
     _write_json(plan_path, {"command": command, "provenance": provenance})
     print(
-        f"SEED_BFCL_PREFLIGHT_OK arm={args.arm} tasks={','.join(task_ids)} "
+        f"SEED_BFCL_PREFLIGHT_OK mode={provenance['mode']} arm={args.arm} "
+        f"train={len(train_ids)} validation={len(validation_ids)} updates={total_updates} "
         f"skill_bank_sha256={bank.sha256}"
     )
     if args.execute:
@@ -314,7 +558,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         _write_json(args.run_root / "metadata" / "gpu.json", gpu)
         log_path = args.run_root / "logs" / f"{args.arm}_train.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8") as log:
+        log_mode = "a" if args.resume == "auto" and log_path.is_file() else "w"
+        with log_path.open(log_mode, encoding="utf-8") as log:
+            log.write(f"\nSEED_BFCL_LAUNCH resume={args.resume} total_updates={total_updates}\n")
             result = subprocess.run(
                 command,
                 cwd=repo_root,

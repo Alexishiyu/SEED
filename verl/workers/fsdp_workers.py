@@ -280,6 +280,19 @@ class ActorRolloutRefWorker(Worker):
                     'bias': "none"
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                trainable_names = [
+                    name
+                    for name, parameter in actor_module.named_parameters()
+                    if parameter.requires_grad
+                ]
+                non_lora_trainables = [
+                    name for name in trainable_names if "lora_" not in name.lower()
+                ]
+                if not trainable_names or non_lora_trainables:
+                    raise RuntimeError(
+                        "LoRA training requires every optimizer parameter to be a LoRA parameter; "
+                        f"non_lora_trainables={non_lora_trainables[:8]}"
+                    )
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -360,12 +373,20 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+            from verl.utils.torch_functional import (
+                build_torch_optimizer,
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+                get_two_stage_linear_schedule,
+            )
 
-            actor_optimizer = optim.AdamW(
+            optimizer_name = str(optim_config.get("name", "adamw")).lower()
+            actor_optimizer = build_torch_optimizer(
                 actor_module_fsdp.parameters(),
+                name=optimizer_name,
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
+                eps=optim_config.get("eps", 1e-8),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
             )
 
@@ -384,6 +405,14 @@ class ActorRolloutRefWorker(Worker):
                 actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps)
             elif warmup_style == "cosine":
                 actor_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps, min_lr_ratio=min_lr_ratio, num_cycles=num_cycles)
+            elif warmup_style == "two_stage_linear":
+                actor_lr_scheduler = get_two_stage_linear_schedule(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    warmup_target_lr=float(optim_config.get("warmup_target_lr")),
+                    final_lr=float(optim_config.get("final_lr", optim_config.lr)),
+                )
             else:
                 raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
 

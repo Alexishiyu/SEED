@@ -18,9 +18,35 @@ from typing import Any, Iterable, Mapping, Sequence
 
 BACKEND_NAME = "june24_skill_summary"
 SCHEMA_VERSION = "seed.june24_skill_summary.v1"
+ALL200_BANK_SCHEMA_VERSION = "seed.june24_skill_summary.all200.v1"
+ALL200_COHORT_SCHEMA_VERSION = "seed.june24_all200.v1"
+ALL200_SPLIT_SCHEMA_VERSION = "seed.june24_all200_split.v1"
 FIXED_SELECTION = "teacher_success_student_failed/fixed"
 EXPECTED_FIXED_COUNT = 40
 EXPECTED_REJECTED_COUNT = 75
+EXPECTED_ALL200_COUNT = 200
+DEFAULT_SPLIT_SEED = 20260624
+DEFAULT_TRAIN_ITERATIONS = 5
+DEFAULT_TRAIN_BATCH_SIZE = 4
+OUTCOME_CLASSES = ("fixed", "both_wrong", "harmed", "both_correct")
+EXPECTED_OUTCOME_COUNTS = {
+    "fixed": 40,
+    "both_wrong": 112,
+    "harmed": 13,
+    "both_correct": 35,
+}
+EXPECTED_TRAIN_OUTCOME_COUNTS = {
+    "fixed": 32,
+    "both_wrong": 90,
+    "harmed": 10,
+    "both_correct": 28,
+}
+EXPECTED_VALIDATION_OUTCOME_COUNTS = {
+    "fixed": 8,
+    "both_wrong": 22,
+    "harmed": 3,
+    "both_correct": 7,
+}
 REQUIRED_FIELDS = ("success_analysis", "mistake_analysis", "golden_workflow")
 SOURCE_FIELDS = ("source_call_path", "source_call_sha256")
 ALLOWED_RECORD_FIELDS = {"task_id", *REQUIRED_FIELDS, *SOURCE_FIELDS}
@@ -55,6 +81,28 @@ def _read_json(path: Path) -> Any:
 
 def _task_id(record: Mapping[str, Any]) -> str:
     return str(record.get("task_id") or record.get("id") or "").strip()
+
+
+def _bfcl_task_sort_key(task_id: str) -> tuple[int, str]:
+    prefix = "multi_turn_base_"
+    if task_id.startswith(prefix):
+        suffix = task_id[len(prefix) :]
+        if suffix.isdigit():
+            return int(suffix), task_id
+    return EXPECTED_ALL200_COUNT + 1, task_id
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _parse_csv_bool(value: Any, *, field: str, task_id: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{task_id}: {field} must be True or False, got {value!r}")
 
 
 def _forbidden_keys(value: Any, prefix: str = "") -> list[str]:
@@ -176,8 +224,252 @@ def validate_fixed_manifest(value: Mapping[str, Any]) -> list[str]:
     return list(task_ids)
 
 
+def build_all200_cohort_manifest(pairwise_tasks_csv: Path) -> dict[str, Any]:
+    """Build the independent, audited June 24 all-200 cohort authority."""
+
+    with pairwise_tasks_csv.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    required = {"task_id", "classification", "baseline_valid", "skill_valid"}
+    if not rows or not required.issubset(rows[0]):
+        raise ValueError(f"pairwise task CSV lacks required columns: {sorted(required)}")
+
+    expected_ids = {f"multi_turn_base_{index}" for index in range(EXPECTED_ALL200_COUNT)}
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    expected_validity = {
+        "fixed": (False, True),
+        "both_wrong": (False, False),
+        "harmed": (True, False),
+        "both_correct": (True, True),
+    }
+    for row in rows:
+        task_id = str(row.get("task_id") or "").strip()
+        classification = str(row.get("classification") or "").strip()
+        if not task_id or task_id in seen:
+            raise ValueError(f"pairwise task CSV has missing or duplicate task id: {task_id!r}")
+        if classification not in expected_validity:
+            raise ValueError(f"{task_id}: unsupported pairwise classification {classification!r}")
+        baseline_valid = _parse_csv_bool(row.get("baseline_valid"), field="baseline_valid", task_id=task_id)
+        skill_valid = _parse_csv_bool(row.get("skill_valid"), field="skill_valid", task_id=task_id)
+        if (baseline_valid, skill_valid) != expected_validity[classification]:
+            raise ValueError(
+                f"{task_id}: classification {classification} disagrees with "
+                f"baseline_valid={baseline_valid}, skill_valid={skill_valid}"
+            )
+        seen.add(task_id)
+        records.append(
+            {
+                "task_id": task_id,
+                "classification": classification,
+                "baseline_valid": baseline_valid,
+                "skill_valid": skill_valid,
+            }
+        )
+
+    if seen != expected_ids:
+        missing = sorted(expected_ids - seen, key=_bfcl_task_sort_key)
+        extras = sorted(seen - expected_ids, key=_bfcl_task_sort_key)
+        raise ValueError(f"all-200 cohort identity mismatch: missing={missing[:10]}, extras={extras[:10]}")
+    records.sort(key=lambda item: _bfcl_task_sort_key(item["task_id"]))
+    counts = {name: sum(record["classification"] == name for record in records) for name in OUTCOME_CLASSES}
+    if counts != EXPECTED_OUTCOME_COUNTS:
+        raise ValueError(f"all-200 outcome counts mismatch: expected={EXPECTED_OUTCOME_COUNTS}, got={counts}")
+
+    return {
+        "schema_version": ALL200_COHORT_SCHEMA_VERSION,
+        "selection": "june24_all200/pairwise_outcomes",
+        "definition": "All 200 June 24 BFCL tasks classified by baseline versus skilled-teacher validity",
+        "task_count": EXPECTED_ALL200_COUNT,
+        "task_ids": [record["task_id"] for record in records],
+        "classification_counts": counts,
+        "records": records,
+        "pairwise_tasks_csv": {
+            "path": str(pairwise_tasks_csv.resolve()),
+            "sha256": sha256_file(pairwise_tasks_csv),
+        },
+        "fail_closed_checks": {
+            "exact_multi_turn_base_0_through_199": True,
+            "exact_unique_count_200": True,
+            "classification_matches_validity": True,
+            "expected_outcome_counts": True,
+        },
+    }
+
+
+def validate_all200_cohort_manifest(value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if value.get("schema_version") != ALL200_COHORT_SCHEMA_VERSION:
+        raise ValueError("cohort manifest is not the audited June 24 all-200 cohort")
+    if value.get("selection") != "june24_all200/pairwise_outcomes":
+        raise ValueError("all-200 cohort selection is invalid")
+    if int(value.get("task_count") or 0) != EXPECTED_ALL200_COUNT:
+        raise ValueError("all-200 cohort task_count is invalid")
+    records = value.get("records")
+    if not isinstance(records, list) or len(records) != EXPECTED_ALL200_COUNT:
+        raise ValueError("all-200 cohort manifest must contain exactly 200 records")
+    expected_ids = [f"multi_turn_base_{index}" for index in range(EXPECTED_ALL200_COUNT)]
+    task_ids = value.get("task_ids")
+    if task_ids != expected_ids:
+        raise ValueError("all-200 cohort task ids must be ordered multi_turn_base_0 through 199")
+    record_ids = [str(record.get("task_id") or "") for record in records if isinstance(record, Mapping)]
+    if record_ids != expected_ids:
+        raise ValueError("all-200 cohort records do not match the canonical task ordering")
+    expected_validity = {
+        "fixed": (False, True),
+        "both_wrong": (False, False),
+        "harmed": (True, False),
+        "both_correct": (True, True),
+    }
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("all-200 cohort record is not an object")
+        classification = record.get("classification")
+        if classification not in expected_validity:
+            raise ValueError(f"{record.get('task_id')}: invalid outcome classification")
+        observed = (record.get("baseline_valid"), record.get("skill_valid"))
+        if observed != expected_validity[classification]:
+            raise ValueError(
+                f"{record.get('task_id')}: outcome classification disagrees with validity flags"
+            )
+    counts = {name: sum(record.get("classification") == name for record in records) for name in OUTCOME_CLASSES}
+    if counts != EXPECTED_OUTCOME_COUNTS or value.get("classification_counts") != counts:
+        raise ValueError("all-200 cohort classification counts are invalid")
+    checks = value.get("fail_closed_checks")
+    required_checks = {
+        "exact_multi_turn_base_0_through_199",
+        "exact_unique_count_200",
+        "classification_matches_validity",
+        "expected_outcome_counts",
+    }
+    if not isinstance(checks, Mapping) or any(checks.get(key) is not True for key in required_checks):
+        raise ValueError("all-200 cohort fail-closed checks are incomplete")
+    source = value.get("pairwise_tasks_csv")
+    if not isinstance(source, Mapping):
+        raise ValueError("all-200 cohort lacks pairwise CSV provenance")
+    source_path = Path(str(source.get("path") or "")).expanduser()
+    source_hash = str(source.get("sha256") or "")
+    if not source_path.is_file() or sha256_file(source_path) != source_hash:
+        raise ValueError("all-200 cohort pairwise CSV SHA-256 mismatch")
+    return [dict(record) for record in records]
+
+
+def build_stratified_split_manifest(
+    cohort_manifest: Path,
+    *,
+    seed: int = DEFAULT_SPLIT_SEED,
+    iterations: int = DEFAULT_TRAIN_ITERATIONS,
+    batch_size: int = DEFAULT_TRAIN_BATCH_SIZE,
+) -> dict[str, Any]:
+    cohort_value = _read_json(cohort_manifest)
+    if not isinstance(cohort_value, Mapping):
+        raise ValueError("all-200 cohort manifest must be a JSON object")
+    records = validate_all200_cohort_manifest(cohort_value)
+    if seed != DEFAULT_SPLIT_SEED or iterations != DEFAULT_TRAIN_ITERATIONS or batch_size != DEFAULT_TRAIN_BATCH_SIZE:
+        raise ValueError("the canonical all-200 split requires seed=20260624, iterations=5, batch_size=4")
+
+    by_class = {
+        name: [record["task_id"] for record in records if record["classification"] == name]
+        for name in OUTCOME_CLASSES
+    }
+    train_ids: list[str] = []
+    validation_ids: list[str] = []
+    for name in OUTCOME_CLASSES:
+        ordered = sorted(by_class[name], key=lambda task_id: (_sha256_text(f"{seed}:{task_id}"), task_id))
+        validation_count = EXPECTED_VALIDATION_OUTCOME_COUNTS[name]
+        validation_ids.extend(ordered[:validation_count])
+        train_ids.extend(ordered[validation_count:])
+    train_ids.sort(key=_bfcl_task_sort_key)
+    validation_ids.sort(key=_bfcl_task_sort_key)
+
+    iteration_schedules = []
+    for iteration in range(1, iterations + 1):
+        ordered = sorted(
+            train_ids,
+            key=lambda task_id: (_sha256_text(f"{seed}:{iteration}:{task_id}"), task_id),
+        )
+        batches = [ordered[index : index + batch_size] for index in range(0, len(ordered), batch_size)]
+        iteration_schedules.append(
+            {
+                "iteration": iteration,
+                "task_ids": ordered,
+                "batches": batches,
+            }
+        )
+
+    return {
+        "schema_version": ALL200_SPLIT_SCHEMA_VERSION,
+        "selection": "june24_all200/stratified_160_40",
+        "seed": seed,
+        "selection_key": "SHA256('20260624:<task_id>') within outcome class",
+        "schedule_key": "SHA256('20260624:<iteration>:<task_id>')",
+        "cohort_manifest": {
+            "path": str(cohort_manifest.resolve()),
+            "sha256": sha256_file(cohort_manifest),
+        },
+        "train": {
+            "task_count": len(train_ids),
+            "task_ids": train_ids,
+            "classification_counts": dict(EXPECTED_TRAIN_OUTCOME_COUNTS),
+        },
+        "validation": {
+            "task_count": len(validation_ids),
+            "task_ids": validation_ids,
+            "classification_counts": dict(EXPECTED_VALIDATION_OUTCOME_COUNTS),
+        },
+        "training_schedule": {
+            "iterations": iterations,
+            "batch_size": batch_size,
+            "updates_per_iteration": len(train_ids) // batch_size,
+            "total_updates": iterations * len(train_ids) // batch_size,
+            "total_rollouts": iterations * len(train_ids),
+            "iteration_schedules": iteration_schedules,
+        },
+    }
+
+
+def validate_stratified_split_manifest(
+    value: Mapping[str, Any],
+    *,
+    cohort_manifest: Path,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    if value.get("schema_version") != ALL200_SPLIT_SCHEMA_VERSION:
+        raise ValueError("split manifest is not the canonical June 24 all-200 160/40 split")
+    cohort_value = _read_json(cohort_manifest)
+    if not isinstance(cohort_value, Mapping):
+        raise ValueError("all-200 cohort manifest must be a JSON object")
+    records = validate_all200_cohort_manifest(cohort_value)
+    cohort_ref = value.get("cohort_manifest")
+    if not isinstance(cohort_ref, Mapping) or cohort_ref.get("sha256") != sha256_file(cohort_manifest):
+        raise ValueError("split manifest cohort hash mismatch")
+    expected = build_stratified_split_manifest(cohort_manifest)
+    if value != expected:
+        raise ValueError("split manifest differs from the deterministic canonical 160/40 split")
+    train_ids = list(value["train"]["task_ids"])
+    validation_ids = list(value["validation"]["task_ids"])
+    all_ids = {record["task_id"] for record in records}
+    if len(train_ids) != 160 or len(validation_ids) != 40 or set(train_ids) & set(validation_ids):
+        raise ValueError("split manifest does not contain disjoint 160/40 task sets")
+    if set(train_ids) | set(validation_ids) != all_ids:
+        raise ValueError("split manifest train/validation union does not cover all 200 tasks")
+    schedules = list(value["training_schedule"]["iteration_schedules"])
+    return train_ids, validation_ids, schedules
+
+
 def _extract_three_fields(source: Mapping[str, Any], task_id: str) -> dict[str, str]:
-    forbidden = _forbidden_keys(source.get("parsed_skill", source))
+    fallback = source.get("fallback")
+    if fallback not in (None, False):
+        raise ValueError(f"{task_id}: fallback June 24 skill records are forbidden")
+    repair_attempts = source.get("repair_attempts")
+    if repair_attempts not in (None, []):
+        raise ValueError(f"{task_id}: repaired June 24 skill records are forbidden")
+    if source.get("repair_request") is not None or source.get("repair_response") is not None:
+        raise ValueError(f"{task_id}: repaired June 24 skill records are forbidden")
+    reference_mode = str(source.get("reference_mode") or "").strip().lower()
+    if any(
+        marker in reference_mode
+        for marker in ("possible_answer", "direct_ground_truth", "regenerated", "v2r")
+    ):
+        raise ValueError(f"{task_id}: structured/V2R June 24 skill source is forbidden")
+    forbidden = _forbidden_keys(source)
     if forbidden:
         raise ValueError(f"{task_id}: forbidden fields in selected skill payload: {forbidden[:8]}")
     skill = source.get("parsed_skill")
@@ -248,14 +540,89 @@ def materialize_skill_bank(
     return bank
 
 
+def materialize_all200_training_skill_bank(
+    *,
+    source_dirs: Sequence[Path],
+    cohort_manifest: Path,
+    split_manifest: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    cohort_value = _read_json(cohort_manifest)
+    split_value = _read_json(split_manifest)
+    if not isinstance(cohort_value, Mapping) or not isinstance(split_value, Mapping):
+        raise ValueError("cohort and split manifests must be JSON objects")
+    records = validate_all200_cohort_manifest(cohort_value)
+    train_ids, _, _ = validate_stratified_split_manifest(
+        split_value,
+        cohort_manifest=cohort_manifest,
+    )
+    train_set = set(train_ids)
+    normalized_records = []
+    source_calls = []
+    for cohort_record in records:
+        task_id = cohort_record["task_id"]
+        candidates = [directory / f"skill_summary_call_{task_id}.json" for directory in source_dirs]
+        matches = [path for path in candidates if path.is_file()]
+        if len(matches) != 1:
+            raise ValueError(f"{task_id}: expected one June 24 source call, found {len(matches)}")
+        source_path = matches[0].resolve()
+        source = _read_json(source_path)
+        if not isinstance(source, Mapping):
+            raise ValueError(f"{task_id}: source call must be a JSON object")
+        fields = _extract_three_fields(source, task_id)
+        source_hash = sha256_file(source_path)
+        source_calls.append(
+            {
+                "task_id": task_id,
+                "source_call_path": str(source_path),
+                "source_call_sha256": source_hash,
+            }
+        )
+        if task_id in train_set:
+            normalized_records.append(
+                {
+                    "task_id": task_id,
+                    **fields,
+                    "source_call_path": str(source_path),
+                    "source_call_sha256": source_hash,
+                }
+            )
+    normalized_records.sort(key=lambda item: _bfcl_task_sort_key(item["task_id"]))
+    if [record["task_id"] for record in normalized_records] != train_ids:
+        raise ValueError("training skill records do not exactly match the frozen 160-task split")
+
+    bank = {
+        "schema_version": ALL200_BANK_SCHEMA_VERSION,
+        "analysis_backend": BACKEND_NAME,
+        "cohort_manifest_path": str(cohort_manifest.resolve()),
+        "cohort_manifest_sha256": sha256_file(cohort_manifest),
+        "split_manifest_path": str(split_manifest.resolve()),
+        "split_manifest_sha256": sha256_file(split_manifest),
+        "task_count": len(normalized_records),
+        "task_ids": train_ids,
+        "source_task_count": len(source_calls),
+        "source_calls": source_calls,
+        "records": normalized_records,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(bank, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return bank
+
+
 @dataclass(frozen=True)
 class June24SkillSummaryBank:
     path: Path
     sha256: str
-    fixed_manifest_path: Path
-    fixed_manifest_sha256: str
+    fixed_manifest_path: Path | None
+    fixed_manifest_sha256: str | None
     fixed_task_ids: tuple[str, ...]
     records: Mapping[str, Mapping[str, str]]
+    cohort_manifest_path: Path | None = None
+    cohort_manifest_sha256: str | None = None
+    split_manifest_path: Path | None = None
+    split_manifest_sha256: str | None = None
+    validation_task_ids: tuple[str, ...] = ()
+    outcome_class_by_task_id: Mapping[str, str] | None = None
 
     analysis_prompt_version: str = "seed"
     skill_mode: str = "episode_only"
@@ -270,24 +637,78 @@ class June24SkillSummaryBank:
 def load_skill_bank(
     path: Path,
     *,
-    fixed_manifest: Path,
+    fixed_manifest: Path | None = None,
+    cohort_manifest: Path | None = None,
+    split_manifest: Path | None = None,
     required_task_ids: Iterable[str] | None = None,
     verify_source_files: bool = True,
 ) -> June24SkillSummaryBank:
     path = path.expanduser().resolve()
-    fixed_manifest = fixed_manifest.expanduser().resolve()
     value = _read_json(path)
-    manifest_value = _read_json(fixed_manifest)
-    if not isinstance(value, Mapping) or not isinstance(manifest_value, Mapping):
-        raise ValueError("skill bank and fixed manifest must be JSON objects")
-    if value.get("schema_version") != SCHEMA_VERSION or value.get("analysis_backend") != BACKEND_NAME:
-        raise ValueError("skill bank is not a June 24 three-field SEED bank")
+    if not isinstance(value, Mapping):
+        raise ValueError("skill bank must be a JSON object")
     if _forbidden_keys(value):
         raise ValueError(f"skill bank contains forbidden fields: {_forbidden_keys(value)[:8]}")
-    fixed_ids = validate_fixed_manifest(manifest_value)
-    manifest_hash = sha256_file(fixed_manifest)
-    if value.get("fixed_manifest_sha256") != manifest_hash:
-        raise ValueError("skill bank fixed-manifest hash mismatch")
+
+    fixed_mode = fixed_manifest is not None
+    all200_mode = cohort_manifest is not None or split_manifest is not None
+    if fixed_mode == all200_mode:
+        raise ValueError("select exactly one skill-bank authority: fixed manifest or all-200 cohort/split manifests")
+    validation_ids: list[str] = []
+    outcome_class_by_task_id: dict[str, str] = {}
+    if fixed_mode:
+        fixed_manifest = fixed_manifest.expanduser().resolve()
+        manifest_value = _read_json(fixed_manifest)
+        if not isinstance(manifest_value, Mapping):
+            raise ValueError("fixed manifest must be a JSON object")
+        if value.get("schema_version") != SCHEMA_VERSION or value.get("analysis_backend") != BACKEND_NAME:
+            raise ValueError("skill bank is not a June 24 fixed-40 three-field SEED bank")
+        allowed_ids = validate_fixed_manifest(manifest_value)
+        outcome_class_by_task_id = {task_id: "fixed" for task_id in allowed_ids}
+        manifest_hash = sha256_file(fixed_manifest)
+        if value.get("fixed_manifest_sha256") != manifest_hash:
+            raise ValueError("skill bank fixed-manifest hash mismatch")
+        cohort_hash = None
+        split_hash = None
+    else:
+        if cohort_manifest is None or split_manifest is None:
+            raise ValueError("all-200 skill bank requires both cohort_manifest and split_manifest")
+        cohort_manifest = cohort_manifest.expanduser().resolve()
+        split_manifest = split_manifest.expanduser().resolve()
+        cohort_value = _read_json(cohort_manifest)
+        split_value = _read_json(split_manifest)
+        if not isinstance(cohort_value, Mapping) or not isinstance(split_value, Mapping):
+            raise ValueError("cohort and split manifests must be JSON objects")
+        if value.get("schema_version") != ALL200_BANK_SCHEMA_VERSION or value.get("analysis_backend") != BACKEND_NAME:
+            raise ValueError("skill bank is not a June 24 all-200 three-field SEED bank")
+        allowed_ids, validation_ids, _ = validate_stratified_split_manifest(
+            split_value,
+            cohort_manifest=cohort_manifest,
+        )
+        outcome_class_by_task_id = {
+            str(record["task_id"]): str(record["classification"])
+            for record in validate_all200_cohort_manifest(cohort_value)
+        }
+        cohort_hash = sha256_file(cohort_manifest)
+        split_hash = sha256_file(split_manifest)
+        if value.get("cohort_manifest_sha256") != cohort_hash:
+            raise ValueError("skill bank cohort-manifest hash mismatch")
+        if value.get("split_manifest_sha256") != split_hash:
+            raise ValueError("skill bank split-manifest hash mismatch")
+        manifest_hash = None
+        source_calls = value.get("source_calls")
+        if not isinstance(source_calls, list) or len(source_calls) != EXPECTED_ALL200_COUNT:
+            raise ValueError("all-200 skill bank must record exactly 200 source calls")
+        if [str(item.get("task_id") or "") for item in source_calls if isinstance(item, Mapping)] != [
+            f"multi_turn_base_{index}" for index in range(EXPECTED_ALL200_COUNT)
+        ]:
+            raise ValueError("all-200 source-call manifest does not cover canonical task ids 0 through 199")
+        if verify_source_files:
+            for item in source_calls:
+                source_path = Path(str(item.get("source_call_path") or "")).expanduser()
+                source_hash = str(item.get("source_call_sha256") or "")
+                if not source_path.is_file() or sha256_file(source_path) != source_hash:
+                    raise ValueError(f"{item.get('task_id')}: all-200 source call SHA-256 mismatch")
 
     raw_records = value.get("records")
     if not isinstance(raw_records, list) or not raw_records:
@@ -302,8 +723,9 @@ def load_skill_bank(
         task_id = _task_id(raw)
         if not task_id or task_id in records:
             raise ValueError(f"missing or duplicate task_id: {task_id!r}")
-        if task_id not in set(fixed_ids):
-            raise ValueError(f"{task_id}: outside corrected fixed-40 cohort")
+        if task_id not in set(allowed_ids):
+            scope = "corrected fixed-40 cohort" if fixed_mode else "frozen 160-task training split"
+            raise ValueError(f"{task_id}: outside {scope}")
         for field in REQUIRED_FIELDS:
             if not isinstance(raw.get(field), str) or not str(raw[field]).strip():
                 raise ValueError(f"{task_id}: missing non-empty {field}")
@@ -324,16 +746,22 @@ def load_skill_bank(
     if len(requested) != len(set(requested)):
         raise ValueError("required task ids contain duplicates")
     missing = [task_id for task_id in requested if task_id not in records]
-    outside = [task_id for task_id in requested if task_id not in set(fixed_ids)]
+    outside = [task_id for task_id in requested if task_id not in set(allowed_ids)]
     if missing or outside:
-        raise ValueError(f"June 24 coverage failure: missing={missing}, outside_fixed40={outside}")
+        raise ValueError(f"June 24 coverage failure: missing={missing}, outside_authority={outside}")
 
     return June24SkillSummaryBank(
         path=path,
         sha256=sha256_file(path),
-        fixed_manifest_path=fixed_manifest,
+        fixed_manifest_path=fixed_manifest if fixed_mode else None,
         fixed_manifest_sha256=manifest_hash,
-        fixed_task_ids=tuple(fixed_ids),
+        fixed_task_ids=tuple(allowed_ids) if fixed_mode else (),
+        cohort_manifest_path=cohort_manifest if all200_mode else None,
+        cohort_manifest_sha256=cohort_hash,
+        split_manifest_path=split_manifest if all200_mode else None,
+        split_manifest_sha256=split_hash,
+        validation_task_ids=tuple(validation_ids),
+        outcome_class_by_task_id=outcome_class_by_task_id,
         records=records,
     )
 

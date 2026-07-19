@@ -23,6 +23,14 @@ The fixed-manifest authority must contain exactly 40 unique rows classified as
 that this cohort is a strict subset of the rejected 75-task all-teacher-success
 cohort and explicitly forbid reuse of that cohort.
 
+The independent `june24_all200` contract is used only by the five-pass
+train-160/validation-40 experiment. It reads the canonical 200-row
+`pairwise_tasks.csv`, requires exact outcome counts (`fixed=40`,
+`both_wrong=112`, `harmed=13`, `both_correct=35`), and freezes a seed-20260624
+stratified split. The normalized runtime bank contains only the 160 training
+summaries while its source manifest records and verifies all 200 source-call
+paths and hashes. Validation summaries are never loaded into a prompt.
+
 ## Agent and loss contract
 
 - `env.env_name=bfcl` resets the exact official task, parses and executes
@@ -72,3 +80,55 @@ materializes the four-task bank directly from the canonical Drive sources, runs
 plain-prompt BFCL evaluation before and after training, trains both arms, merges
 the privileged LoRA, verifies vLLM reload, and writes a single completion report
 under the Drive-backed run root.
+
+## Five-pass 160/40 experiment
+
+Build the all-200 cohort, deterministic split, and train-only bank:
+
+```bash
+python scripts/build_june24_all200_skill_bank.py \
+  --pairwise-tasks-csv /drive/bfcl_qwen_pairwise_analysis/15fRBFq4gbXgJeQ5CHO_bVjeEp0mlH9rB/pairwise_tasks.csv \
+  --source-dir /drive/bfcl_qwen_experiment/a100_skill_sd_50_20260624_055240/skills_openai \
+  --source-dir /drive/bfcl_qwen_experiment/a100_skill_sd_150_50_199_20260624_063820/skills_openai \
+  --cohort-manifest /run/inputs/june24_all200_cohort.json \
+  --split-manifest /run/inputs/june24_train160_val40_split.json \
+  --output /run/inputs/june24_train160_skill_bank.json
+```
+
+Preflight or execute the continuous five-iteration job:
+
+```bash
+python examples/seed_trainer/run_bfcl_opsd.py \
+  --june24-skill-bank /run/inputs/june24_train160_skill_bank.json \
+  --cohort-manifest /run/inputs/june24_all200_cohort.json \
+  --split-manifest /run/inputs/june24_train160_val40_split.json \
+  --run-root /content/drive/MyDrive/bfcl_qwen_experiment/seed_opsd_colab/june24_all200_train160_val40_<timestamp> \
+  --bfcl-root /path/to/gorilla/berkeley-function-call-leaderboard \
+  --iterations 5 --batch-size 4 --optimizer adam \
+  --warmup-updates 67 --warmup-target-lr 1e-7 --final-lr 1e-6 \
+  --inline-same-prompt-diagnostics --resume auto \
+  --rlpaper-sha <sha>
+```
+
+This materializes 800 ordered training rows: 160 tasks once in each of five
+iterations. It performs 40 updates per iteration, validates the ordinary BFCL
+prompt at steps 0/40/80/120/160/200, and keeps resumable checkpoints at the
+five nonzero validation steps. Strict Adam uses betas `(0.9, 0.999)`, epsilon
+`1e-8`, and zero weight decay. The first 67 updates rise from zero to `1e-7`;
+the remaining updates rise linearly to `1e-6`.
+
+Each four-task batch is one Adam update even when BFCL flattens those task
+trajectories into more than four active tool turns. The actor accumulates all
+active generated-token losses with full-batch token-mean weighting before the
+single optimizer step. Update evidence records exact task order, iteration and
+batch coordinates, class-level metrics, token/mask hashes, LR, gradients, and
+before/after LoRA hashes. Resume restores the model, Adam, scheduler, actor and
+driver RNG state, and the stateful data position.
+
+Inline control diagnostics rescore the exact same response tokens under the
+ordinary prompt but never contribute that control signal to the gradient.
+They are debugging evidence, not a separately trained causal control arm. Use
+`examples/seed_trainer/bfcl_seed_opsd_160x40_a100.ipynb` as the thin A100
+controller. It writes all inputs, validation curves, checkpoints, update-level
+token/hash evidence, the final merged export, and the completion report under
+one fresh Drive-backed run root.

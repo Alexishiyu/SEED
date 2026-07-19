@@ -61,6 +61,8 @@ __all__ = ["DataParallelPPOActor", "compose_actor_objective"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+JUNE24_OUTCOME_CLASSES = ("fixed", "both_wrong", "harmed", "both_correct")
+
 
 def compose_actor_objective(
     *,
@@ -136,6 +138,15 @@ class DataParallelPPOActor(BasePPOActor):
             count += tensor.numel()
         if count == 0:
             raise RuntimeError("actor.opd_only found no trainable parameters")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _tensor_sha256(tensor: torch.Tensor) -> str:
+        value = tensor.detach().contiguous().cpu()
+        digest = hashlib.sha256()
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.numpy().tobytes())
         return digest.hexdigest()
 
     @staticmethod
@@ -802,7 +813,46 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
         self.global_step = int(data.meta_info.get("global_step", self.global_step) or 0)
         opd_only = bool(self.config.get("opd_only", False))
+        task_ids_for_evidence = []
+        outcome_classes_for_evidence = []
+        for task_id, outcome_class in zip(
+            data.non_tensor_batch.get("task_id", []),
+            data.non_tensor_batch.get("june24_outcome_class", []),
+        ):
+            task_id = str(task_id)
+            outcome_class = str(outcome_class)
+            if task_id not in task_ids_for_evidence:
+                task_ids_for_evidence.append(task_id)
+                outcome_classes_for_evidence.append(outcome_class)
         trainable_sha_before = self._trainable_parameter_sha256() if opd_only else None
+        response_token_sha256 = self._tensor_sha256(data.batch["responses"]) if opd_only else None
+        if opd_only:
+            response_length_for_evidence = data.batch["responses"].size(-1)
+            if multi_turn:
+                generated_mask_for_evidence = data.batch["loss_mask"][:, -response_length_for_evidence:].bool()
+            else:
+                generated_mask_for_evidence = data.batch["attention_mask"][:, -response_length_for_evidence:].bool()
+            generated_mask_sha256 = self._tensor_sha256(generated_mask_for_evidence)
+            teacher_step_mask_for_evidence = data.batch.get("teacher_signal_mask")
+            active_token_count_for_evidence = (
+                int((generated_mask_for_evidence & teacher_step_mask_for_evidence.bool().unsqueeze(-1)).sum().item())
+                if teacher_step_mask_for_evidence is not None
+                else 0
+            )
+            active_tokens_by_class_for_evidence = {}
+            outcome_class_ids_for_evidence = data.batch.get("june24_outcome_class_id")
+            if outcome_class_ids_for_evidence is not None and teacher_step_mask_for_evidence is not None:
+                active_mask_for_evidence = (
+                    generated_mask_for_evidence
+                    & teacher_step_mask_for_evidence.bool().unsqueeze(-1)
+                )
+                for class_id, class_name in enumerate(JUNE24_OUTCOME_CLASSES):
+                    active_tokens_by_class_for_evidence[class_name] = int(
+                        (
+                            active_mask_for_evidence
+                            & outcome_class_ids_for_evidence.eq(class_id).unsqueeze(-1)
+                        ).sum().item()
+                    )
         use_env_aux_loss = False if opd_only else self._env_aux_loss_enabled()
         if use_env_aux_loss and self.config.use_dynamic_bsz:
             raise RuntimeError("SP/ID environment auxiliary loss is not supported with actor.use_dynamic_bsz=True.")
@@ -822,6 +872,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         teacher_mask_key = "teacher_signal_mask" if "teacher_signal_mask" in data.batch.keys() else "critical_step_mask"
         has_teacher_signal = "teacher_log_prob" in data.batch.keys() and teacher_mask_key in data.batch.keys()
+        has_control_teacher_signal = "control_teacher_log_prob" in data.batch.keys()
         use_opd_loss = (
             opd_loss_coef > 0
             and has_teacher_signal
@@ -843,6 +894,10 @@ class DataParallelPPOActor(BasePPOActor):
                 raise RuntimeError("actor.opd_only requires aligned teacher_log_prob and teacher_signal_mask")
         if use_opd_loss:
             select_keys.extend(["teacher_log_prob", teacher_mask_key])
+            if has_control_teacher_signal:
+                select_keys.append("control_teacher_log_prob")
+        if "june24_outcome_class_id" in data.batch.keys():
+            select_keys.append("june24_outcome_class_id")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -870,7 +925,15 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        if has_multi_modal_inputs or use_env_aux_loss:
+        if opd_only:
+            # A BFCL rollout batch contains four tasks but may flatten to more
+            # than four active tool turns.  OPD accumulates every active turn
+            # and performs exactly one optimizer step for the four-task batch.
+            # Splitting here by ppo_mini_batch_size would make the number of
+            # optimizer steps depend on trajectory length and break the frozen
+            # 200-update schedule.
+            dataloader = [batch]
+        elif has_multi_modal_inputs or use_env_aux_loss:
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
@@ -889,7 +952,13 @@ class DataParallelPPOActor(BasePPOActor):
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    effective_mini_batch_size = int(mini_batch.batch_size[0]) if opd_only else int(self.config.ppo_mini_batch_size)
+                    if effective_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu != 0:
+                        raise ValueError(
+                            "effective OPD turn batch must be divisible by "
+                            "ppo_micro_batch_size_per_gpu"
+                        )
+                    self.gradient_accumulation = effective_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -963,6 +1032,11 @@ class DataParallelPPOActor(BasePPOActor):
                     opd_gate_mean = log_prob.new_tensor(0.0)
                     opd_gate_active_ratio = log_prob.new_tensor(0.0)
                     opd_teacher_gap_mean = log_prob.new_tensor(0.0)
+                    control_opd_loss = log_prob.new_tensor(0.0)
+                    control_opd_active_token_ratio = log_prob.new_tensor(0.0)
+                    control_opd_gate_mean = log_prob.new_tensor(0.0)
+                    control_opd_gate_active_ratio = log_prob.new_tensor(0.0)
+                    control_opd_teacher_gap_mean = log_prob.new_tensor(0.0)
                     if use_opd_loss and "teacher_log_prob" in data and teacher_mask_key in data:
                         (
                             opd_loss,
@@ -984,6 +1058,72 @@ class DataParallelPPOActor(BasePPOActor):
                             opd_loss_coef=opd_loss_coef,
                             opd_only=opd_only,
                         )
+                        if "control_teacher_log_prob" in data:
+                            (
+                                control_opd_loss,
+                                control_opd_active_token_ratio,
+                                control_opd_gate_mean,
+                                control_opd_gate_active_ratio,
+                                control_opd_teacher_gap_mean,
+                            ) = compute_opd_loss(
+                                log_prob=log_prob,
+                                teacher_log_prob=data["control_teacher_log_prob"],
+                                response_mask=response_mask,
+                                opd_step_mask=data[teacher_mask_key],
+                                gate_beta=self.config.get("opd_gate_beta", 5.0),
+                                loss_agg_mode=loss_agg_mode,
+                            )
+
+                        if "june24_outcome_class_id" in data:
+                            for class_id, class_name in enumerate(JUNE24_OUTCOME_CLASSES):
+                                class_rows = data["june24_outcome_class_id"].eq(class_id)
+                                if not bool(class_rows.any()):
+                                    continue
+                                (
+                                    class_opd_loss,
+                                    _,
+                                    class_gate_mean,
+                                    _,
+                                    class_gap_mean,
+                                ) = compute_opd_loss(
+                                    log_prob=log_prob[class_rows],
+                                    teacher_log_prob=data["teacher_log_prob"][class_rows],
+                                    response_mask=response_mask[class_rows],
+                                    opd_step_mask=data[teacher_mask_key][class_rows],
+                                    gate_beta=self.config.get("opd_gate_beta", 5.0),
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                append_to_dict(
+                                    metrics,
+                                    {
+                                        f"actor/opd_by_class/{class_name}/loss": class_opd_loss.detach().item(),
+                                        f"actor/opd_by_class/{class_name}/gate_mean": class_gate_mean.detach().item(),
+                                        f"actor/opd_by_class/{class_name}/teacher_gap_mean": class_gap_mean.detach().item(),
+                                    },
+                                )
+                                if "control_teacher_log_prob" in data:
+                                    (
+                                        class_control_loss,
+                                        _,
+                                        class_control_gate_mean,
+                                        _,
+                                        class_control_gap_mean,
+                                    ) = compute_opd_loss(
+                                        log_prob=log_prob[class_rows],
+                                        teacher_log_prob=data["control_teacher_log_prob"][class_rows],
+                                        response_mask=response_mask[class_rows],
+                                        opd_step_mask=data[teacher_mask_key][class_rows],
+                                        gate_beta=self.config.get("opd_gate_beta", 5.0),
+                                        loss_agg_mode=loss_agg_mode,
+                                    )
+                                    append_to_dict(
+                                        metrics,
+                                        {
+                                            f"actor/control_by_class/{class_name}/loss": class_control_loss.detach().item(),
+                                            f"actor/control_by_class/{class_name}/gate_mean": class_control_gate_mean.detach().item(),
+                                            f"actor/control_by_class/{class_name}/teacher_gap_mean": class_control_gap_mean.detach().item(),
+                                        },
+                                    )
 
                     if self.config.use_kl_loss and not opd_only:
                         ref_log_prob = data["ref_log_prob"]
@@ -1005,7 +1145,20 @@ class DataParallelPPOActor(BasePPOActor):
                         env_aux_loss, env_aux_metrics = self.compute_env_auxiliary_loss(data)
                         policy_loss = policy_loss + env_aux_loss
 
-                    if self.config.use_dynamic_bsz:
+                    if opd_only and loss_agg_mode == "token-mean":
+                        micro_opd_mask = response_mask * data[teacher_mask_key].to(
+                            device=response_mask.device,
+                            dtype=response_mask.dtype,
+                        ).unsqueeze(-1)
+                        micro_active_tokens = micro_opd_mask.sum()
+                        if active_token_count_for_evidence <= 0:
+                            raise RuntimeError("OPD-only update has zero active tokens")
+                        # Match one full-batch compute_opd_loss(token-mean)
+                        # exactly while keeping one-turn microbatches for memory.
+                        loss = policy_loss * (
+                            micro_active_tokens / float(active_token_count_for_evidence)
+                        )
+                    elif self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
@@ -1023,6 +1176,11 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/opd_gate_mean": opd_gate_mean.detach().item(),
                         "actor/opd_gate_active_ratio": opd_gate_active_ratio.detach().item(),
                         "actor/opd_teacher_gap_mean": opd_teacher_gap_mean.detach().item(),
+                        "actor/control_opd_loss": control_opd_loss.detach().item(),
+                        "actor/control_opd_active_token_ratio": control_opd_active_token_ratio.detach().item(),
+                        "actor/control_opd_gate_mean": control_opd_gate_mean.detach().item(),
+                        "actor/control_opd_gate_active_ratio": control_opd_gate_active_ratio.detach().item(),
+                        "actor/control_opd_teacher_gap_mean": control_opd_teacher_gap_mean.detach().item(),
                         "actor/opd_only": 1.0 if opd_only else 0.0,
                         "actor/rl_gradient_contribution": 0.0 if opd_only else 1.0,
                         "actor/env_aux_loss": env_aux_loss.detach().item(),
@@ -1068,5 +1226,90 @@ class DataParallelPPOActor(BasePPOActor):
                     f"before={trainable_sha_before} after={trainable_sha_after} changed={checksum_changed}",
                     flush=True,
                 )
+                diagnostics_root = self.config.get("opd_diagnostics_path")
+                if diagnostics_root:
+                    def _metric_mean(key: str) -> float:
+                        values = metrics.get(key, [])
+                        if not isinstance(values, (list, tuple)):
+                            values = [values]
+                        return float(sum(float(value) for value in values) / len(values)) if values else 0.0
+
+                    diagnostics = {
+                        "global_step": self.global_step,
+                        "iteration": ((self.global_step - 1) // 40) + 1,
+                        "batch_in_iteration": ((self.global_step - 1) % 40) + 1,
+                        "task_ids": task_ids_for_evidence,
+                        "outcome_classes": outcome_classes_for_evidence,
+                        "outcome_class_counts": {
+                            class_name: outcome_classes_for_evidence.count(class_name)
+                            for class_name in JUNE24_OUTCOME_CLASSES
+                        },
+                        "response_token_sha256": response_token_sha256,
+                        "generated_token_mask_sha256": generated_mask_sha256,
+                        "generated_token_only_mask": True,
+                        "teacher_student_token_alignment": True,
+                        "control_teacher_student_token_alignment": has_control_teacher_signal,
+                        "active_token_count": active_token_count_for_evidence,
+                        "active_tokens_by_outcome_class": active_tokens_by_class_for_evidence,
+                        "learning_rate_used": float(self.actor_optimizer.param_groups[0]["lr"]),
+                        "optimizer": type(self.actor_optimizer).__name__,
+                        "optimizer_steps_in_batch": 1,
+                        "trainable_sha256_before": trainable_sha_before,
+                        "trainable_sha256_after": trainable_sha_after,
+                        "trainable_changed": checksum_changed,
+                        "metrics": {
+                            key: _metric_mean(key)
+                            for key in (
+                                "actor/opd_loss",
+                                "actor/opd_gate_mean",
+                                "actor/opd_teacher_gap_mean",
+                                "actor/control_opd_loss",
+                                "actor/control_opd_gate_mean",
+                                "actor/control_opd_teacher_gap_mean",
+                                "actor/grad_norm",
+                                "actor/rl_gradient_contribution",
+                            )
+                        },
+                        "outcome_class_metrics": {
+                            class_name: {
+                                "opd_loss": _metric_mean(f"actor/opd_by_class/{class_name}/loss"),
+                                "gate_mean": _metric_mean(f"actor/opd_by_class/{class_name}/gate_mean"),
+                                "teacher_gap_mean": _metric_mean(
+                                    f"actor/opd_by_class/{class_name}/teacher_gap_mean"
+                                ),
+                                "control_opd_loss": _metric_mean(
+                                    f"actor/control_by_class/{class_name}/loss"
+                                ),
+                                "control_gate_mean": _metric_mean(
+                                    f"actor/control_by_class/{class_name}/gate_mean"
+                                ),
+                                "control_teacher_gap_mean": _metric_mean(
+                                    f"actor/control_by_class/{class_name}/teacher_gap_mean"
+                                ),
+                            }
+                            for class_name in JUNE24_OUTCOME_CLASSES
+                            if active_tokens_by_class_for_evidence.get(class_name, 0) > 0
+                        },
+                    }
+                    diagnostics["privileged_minus_control"] = {
+                        "teacher_gap_mean": (
+                            diagnostics["metrics"]["actor/opd_teacher_gap_mean"]
+                            - diagnostics["metrics"]["actor/control_opd_teacher_gap_mean"]
+                        ),
+                        "gate_mean": (
+                            diagnostics["metrics"]["actor/opd_gate_mean"]
+                            - diagnostics["metrics"]["actor/control_opd_gate_mean"]
+                        ),
+                        "opd_loss": (
+                            diagnostics["metrics"]["actor/opd_loss"]
+                            - diagnostics["metrics"]["actor/control_opd_loss"]
+                        ),
+                    }
+                    diagnostics_path = Path(str(diagnostics_root)).expanduser() / f"step_{self.global_step:06d}.json"
+                    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+                    diagnostics_path.write_text(
+                        json.dumps(diagnostics, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
         self.actor_optimizer.zero_grad()
         return metrics

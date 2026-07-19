@@ -527,6 +527,92 @@ def get_constant_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def get_two_stage_linear_schedule(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    warmup_target_lr: float,
+    final_lr: float,
+    last_epoch: int = -1,
+):
+    """Warm from zero to an intermediate LR, then rise linearly to the final LR.
+
+    ``num_warmup_steps`` counts optimizer updates, including the zero-LR first
+    update and the update that reaches ``warmup_target_lr``.  This makes the
+    200-step BFCL contract exact: indices 0, 66, and 199 use 0, 1e-7, and 1e-6.
+    """
+
+    if num_training_steps < 2:
+        raise ValueError("two-stage linear scheduling requires at least two training steps")
+    if num_warmup_steps < 2 or num_warmup_steps >= num_training_steps:
+        raise ValueError("num_warmup_steps must be in [2, num_training_steps - 1]")
+    if warmup_target_lr <= 0 or final_lr <= 0 or final_lr < warmup_target_lr:
+        raise ValueError("two-stage learning rates must satisfy 0 < warmup_target_lr <= final_lr")
+    base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    if any(base_lr <= 0 for base_lr in base_lrs):
+        raise ValueError("optimizer base learning rates must be positive")
+
+    warmup_last_index = num_warmup_steps - 1
+    final_index = num_training_steps - 1
+
+    def lr_lambda(current_step: int):
+        multipliers = []
+        for base_lr in base_lrs:
+            if current_step <= warmup_last_index:
+                lr = warmup_target_lr * float(current_step) / float(warmup_last_index)
+            else:
+                progress = float(current_step - warmup_last_index) / float(final_index - warmup_last_index)
+                lr = warmup_target_lr + (final_lr - warmup_target_lr) * progress
+            multipliers.append(lr / base_lr)
+        return multipliers[0] if len(multipliers) == 1 else multipliers
+
+    # LambdaLR accepts one lambda per parameter group. Keep group-specific base
+    # rates correct without changing the common single-group SEED path.
+    if len(base_lrs) == 1:
+        return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+    def group_lambda(index: int):
+        def value(current_step: int):
+            if current_step <= warmup_last_index:
+                lr = warmup_target_lr * float(current_step) / float(warmup_last_index)
+            else:
+                progress = float(current_step - warmup_last_index) / float(final_index - warmup_last_index)
+                lr = warmup_target_lr + (final_lr - warmup_target_lr) * progress
+            return lr / base_lrs[index]
+
+        return value
+
+    return LambdaLR(optimizer, [group_lambda(index) for index in range(len(base_lrs))], last_epoch)
+
+
+def build_torch_optimizer(
+    parameters,
+    *,
+    name: str,
+    lr: float,
+    betas=(0.9, 0.999),
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+):
+    """Construct the configured Adam-family optimizer over trainable parameters."""
+
+    trainable = [parameter for parameter in parameters if parameter.requires_grad]
+    if not trainable:
+        raise ValueError("optimizer received no trainable parameters")
+    normalized = str(name).strip().lower()
+    kwargs = {
+        "lr": float(lr),
+        "betas": tuple(float(value) for value in betas),
+        "eps": float(eps),
+        "weight_decay": float(weight_decay),
+    }
+    if normalized == "adam":
+        return torch.optim.Adam(trainable, **kwargs)
+    if normalized == "adamw":
+        return torch.optim.AdamW(trainable, **kwargs)
+    raise ValueError(f"unsupported optimizer {name!r}; expected 'adam' or 'adamw'")
+
+
 def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds):
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]

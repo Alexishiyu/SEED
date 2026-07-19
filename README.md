@@ -249,6 +249,10 @@ possible answers, predicted calls/state, structured targets, fallback, repair,
 and external analyzer calls. See
 [`docs/bfcl_june24_opsd.md`](docs/bfcl_june24_opsd.md) and the A100 controller
 [`examples/seed_trainer/bfcl_seed_opsd_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_a100.ipynb).
+The separate five-pass all-200 experiment uses the frozen stratified 160/40
+split controller
+[`examples/seed_trainer/bfcl_seed_opsd_160x40_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_160x40_a100.ipynb);
+it does not relax or relabel the fixed-40 smoke contract.
 
 Other teacher-self SFT entrypoints use the same naming convention:
 
