@@ -227,6 +227,7 @@ def _hydra_command(
         "actor_rollout_ref.actor.opd_gate_beta=5.0",
         f"actor_rollout_ref.actor.opd_evidence_path={evidence_root / 'trainable_checksum.json'}",
         f"actor_rollout_ref.actor.opd_diagnostics_path={evidence_root / 'updates'}",
+        f"actor_rollout_ref.actor.lora_only_resume={str(all200_mode)}",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={total_model_len}",
         "actor_rollout_ref.actor.use_torch_compile=False",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",

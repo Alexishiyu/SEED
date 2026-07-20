@@ -55,6 +55,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin] = None,
         checkpoint_contents: Optional[list] = None,
+        lora_only_resume: bool = False,
         **kwargs,
     ):
         if checkpoint_contents is None:
@@ -71,6 +72,50 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             lr_scheduler=lr_scheduler,
             processing_class=processing_class,
             checkpoint_contents=checkpoint_contents,
+        )
+        self.lora_only_resume = bool(lora_only_resume)
+
+    def _load_lora_adapter(self, adapter_path: str) -> None:
+        """Restore trainable PEFT weights without reading a full base-model shard.
+
+        Single-GPU BFCL checkpoints live on DriveFS.  Their ordinary FSDP model
+        shard contains the frozen base model as well as the LoRA tensors and is
+        roughly 18 GB, while ``lora_adapter`` contains the complete trainable
+        state in tens of MB.  Loading the adapter under a writeback-enabled FSDP
+        full-parameter context is equivalent for a LoRA-only optimizer and avoids
+        blocking every recovery segment on the frozen base weights.
+        """
+
+        from peft import PeftModel
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        state_dict = load_file(adapter_path, device="cpu")
+
+        def apply(model) -> None:
+            if not isinstance(model, PeftModel):
+                raise RuntimeError(
+                    "LoRA-only checkpoint resume requires a PeftModel, got "
+                    f"{type(model).__name__}"
+                )
+            result = set_peft_model_state_dict(model, state_dict, adapter_name="default")
+            unexpected = list(getattr(result, "unexpected_keys", []) or [])
+            if unexpected:
+                raise RuntimeError(
+                    "LoRA adapter checkpoint contains unexpected keys: "
+                    f"{unexpected[:8]}"
+                )
+
+        if isinstance(self.model, FSDP):
+            with FSDP.summon_full_params(self.model, recurse=True, writeback=True):
+                apply(self.model._fsdp_wrapped_module)
+        else:
+            apply(self.model)
+
+        print(
+            f"[rank-{self.rank}]: SEED_LORA_ONLY_CHECKPOINT_LOAD adapter={adapter_path} "
+            f"tensors={len(state_dict)}",
+            flush=True,
         )
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
@@ -94,17 +139,23 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
         remote_extra_state_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
         print(f"[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}")
-        local_model_path = copy_to_local(remote_model_path)
+        adapter_path = os.path.join(local_path, "lora_adapter", "adapter_model.safetensors")
+        use_lora_only_resume = self.lora_only_resume and os.path.isfile(adapter_path)
+        local_model_path = None if use_lora_only_resume else copy_to_local(remote_model_path)
         local_optim_path = copy_to_local(remote_optim_path)
         local_extra_state_path = copy_to_local(remote_extra_state_path)
 
-        model_state_dict = torch.load(local_model_path, weights_only=False)
+        if use_lora_only_resume:
+            self._load_lora_adapter(adapter_path)
+            model_state_dict = None
+        else:
+            model_state_dict = torch.load(local_model_path, weights_only=False)
         optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
         extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
         if del_local_after_load:
             try:
-                os.remove(local_model_path) if is_non_local(local_model_path) else None
+                os.remove(local_model_path) if local_model_path and is_non_local(local_model_path) else None
                 os.remove(local_optim_path) if is_non_local(local_optim_path) else None
                 os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
             except Exception as e:
@@ -115,7 +166,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
-            self.model.load_state_dict(model_state_dict)
+            if model_state_dict is not None:
+                self.model.load_state_dict(model_state_dict)
             if self.optimizer is not None:
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state

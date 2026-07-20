@@ -631,6 +631,9 @@ class ActorRolloutRefWorker(Worker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
+                lora_only_resume=(
+                    self._is_lora and self.config.actor.get("lora_only_resume", False)
+                ),
             )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

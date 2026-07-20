@@ -141,6 +141,13 @@ Colab runtime cutoff while leaving the 800-row order, five 40-update
 iterations, validation boundaries, and 200-step learning-rate schedule
 unchanged. Every new segment must advance by exactly 10 updates; historical
 40-update segments remain valid migration evidence.
+For LoRA runs, recovery restores the adapter from the checkpoint's
+`lora_adapter/adapter_model.safetensors` and restores Adam, scheduler, RNG, and
+dataset position from their ordinary checkpoint files. The frozen base model is
+reloaded from the pinned Hugging Face model rather than reread from the roughly
+18 GB DriveFS model shard. The full model shard remains mandatory and preserved
+for conventional resumability/export evidence; update-level checksum continuity
+must prove that the adapter-only recovery is exact.
 `metadata/privileged_june24_segment_history.json` records the checkpoint and
 SEED SHA used for each segment. If per-update evidence extends beyond the last
 atomic checkpoint after a runtime loss, the launcher archives those orphaned

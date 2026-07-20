@@ -86,6 +86,7 @@ actor_rollout_ref:
       loss_mode: "vanilla"
     checkpoint:
       contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+    lora_only_resume: False # restore PEFT weights plus optimizer/extra without rereading frozen base-model shards
     optim:
       name: adamw # adam / adamw; existing recipes retain AdamW
       lr: 1e-6

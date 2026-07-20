@@ -90,3 +90,21 @@ def test_bfcl_launcher_releases_rollout_cache_before_actor_rescoring():
 
     assert '"actor_rollout_ref.rollout.free_cache_engine=True"' in source
     assert '"actor_rollout_ref.rollout.free_cache_engine=False"' not in source
+
+
+def test_bfcl_all200_resume_uses_lora_only_model_restore():
+    launcher = (REPO_ROOT / "examples/seed_trainer/run_bfcl_opsd.py").read_text(
+        encoding="utf-8"
+    )
+    manager = (
+        REPO_ROOT / "verl/utils/checkpoint/fsdp_checkpoint_manager.py"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'f"actor_rollout_ref.actor.lora_only_resume={str(all200_mode)}"'
+        in launcher
+    )
+    assert "SEED_LORA_ONLY_CHECKPOINT_LOAD" in manager
+    assert "FSDP.summon_full_params(self.model, recurse=True, writeback=True)" in manager
+    assert "self.optimizer.load_state_dict(optimizer_state_dict)" in manager
+    assert "self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)" in manager
