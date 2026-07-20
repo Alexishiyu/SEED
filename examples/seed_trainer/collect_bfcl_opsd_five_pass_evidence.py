@@ -78,6 +78,45 @@ def _checkpoint_evidence(checkpoint_root: Path) -> list[dict[str, Any]]:
     return evidence
 
 
+def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"missing checkpoint-process segment history: {path}")
+    payload = _json(path)
+    if payload.get("schema_version") != "seed.bfcl.segment_history.v1":
+        raise RuntimeError("checkpoint-process segment history has an invalid schema")
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise RuntimeError("checkpoint-process segment history is empty")
+
+    covered = set()
+    for item in segments:
+        kind = item.get("kind")
+        after = int(item.get("checkpoint_after") or -1)
+        before = int(item.get("checkpoint_before") or -1)
+        if kind == "training_segment":
+            expected = int(item.get("expected_checkpoint") or -1)
+            if int(item.get("returncode") or 0) != 0:
+                raise RuntimeError(f"checkpoint-process segment {before}->{after} failed")
+            if expected != after or after - before != 40:
+                raise RuntimeError(f"checkpoint-process segment did not advance exactly 40 steps: {item}")
+        elif kind == "adopted_existing_checkpoint":
+            if before != after:
+                raise RuntimeError(f"adopted checkpoint history is inconsistent: {item}")
+        else:
+            raise RuntimeError(f"unknown checkpoint-process segment kind: {kind}")
+        if after not in CHECKPOINT_STEPS:
+            raise RuntimeError(f"noncanonical checkpoint in segment history: {after}")
+        if item.get("seed_sha") not in seed_sha_history:
+            raise RuntimeError(f"unrecorded SEED SHA in segment history: {item.get('seed_sha')}")
+        covered.add(after)
+
+    if covered != set(CHECKPOINT_STEPS):
+        raise RuntimeError(
+            f"segment history does not cover every checkpoint: expected={CHECKPOINT_STEPS}, got={sorted(covered)}"
+        )
+    return payload
+
+
 def _update_evidence(
     root: Path,
     *,
@@ -219,6 +258,32 @@ def _validation_evidence(
     return curve
 
 
+def _privileged_control_comparison(updates: list[dict[str, Any]]) -> dict[str, Any]:
+    metric_names = ("teacher_gap_mean", "gate_mean", "opd_loss")
+    aggregates = {}
+    for metric_name in metric_names:
+        values = [
+            _require_finite(
+                (update.get("privileged_minus_control") or {}).get(metric_name),
+                f"privileged-minus-control {metric_name}",
+            )
+            for update in updates
+        ]
+        aggregates[metric_name] = {
+            "mean": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+            "positive_update_count": sum(value > 0 for value in values),
+            "negative_update_count": sum(value < 0 for value in values),
+            "zero_update_count": sum(value == 0 for value in values),
+        }
+    return {
+        "scope": "same_sampled_tokens_ordinary_prompt_diagnostic_control",
+        "update_count": len(updates),
+        "metrics": aggregates,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
@@ -303,6 +368,10 @@ def main() -> None:
         classification_by_id=classification_by_id,
     )
     checkpoints = _checkpoint_evidence(run_root / "checkpoints" / "privileged_june24")
+    segment_history = _segment_evidence(
+        run_root / "metadata" / "privileged_june24_segment_history.json",
+        seed_sha_history=[str(value) for value in provenance.get("seed_sha_history") or [provenance["seed_sha"]]],
+    )
     for checkpoint in checkpoints[:-1]:
         next_step = checkpoint["global_step"] + 1
         if updates[next_step - 1]["trainable_sha256_before"] != updates[checkpoint["global_step"] - 1]["trainable_sha256_after"]:
@@ -328,13 +397,19 @@ def main() -> None:
         "provenance": provenance,
         "source_call_count": len(source_calls),
         "checkpoints": checkpoints,
+        "checkpoint_process_segments": segment_history,
         "optimizer_updates": {
             "count": len(updates),
             "first": updates[0],
             "warmup_boundary": updates[66],
             "last": updates[-1],
         },
+        "privileged_versus_control": _privileged_control_comparison(updates),
         "validation_curve": validation_curve,
+        "official_plain_prompt_bfcl_before_after": {
+            "before": validation_curve[0],
+            "after": validation_curve[-1],
+        },
         "validation_curve_path": str(curve_path),
         "checkpoint_and_export": export,
     }

@@ -47,8 +47,12 @@ def run_ppo(config) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    runner = TaskRunner.remote()
-    ray.get(runner.run.remote(config))
+    try:
+        runner = TaskRunner.remote()
+        ray.get(runner.run.remote(config))
+    finally:
+        if config.trainer.get("shutdown_local_ray_on_exit", False):
+            ray.shutdown()
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head

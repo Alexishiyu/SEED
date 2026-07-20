@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from examples.seed_trainer._common.bfcl_checkpoint_supervisor import run_checkpoint_segments
 from agent_system.environments.env_package.bfcl.envs import (
     BFCLWorker,
     hydrate_task,
@@ -158,6 +159,8 @@ def _hydra_command(
     updates_per_iteration: int,
 ) -> list[str]:
     total_model_len = args.max_prompt_length + args.max_response_length
+    all200_mode = args.cohort_manifest is not None
+    rollout_gpu_memory_utilization = 0.40 if all200_mode else 0.45
     checkpoint_root = args.run_root / "checkpoints" / args.arm
     evidence_root = args.run_root / "evidence" / args.arm
     task_csv = ",".join(task_ids)
@@ -227,7 +230,7 @@ def _hydra_command(
         "actor_rollout_ref.rollout.mode=sync",
         "actor_rollout_ref.rollout.n=1",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.45",
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={rollout_gpu_memory_utilization}",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False",
@@ -252,6 +255,9 @@ def _hydra_command(
         "trainer.total_epochs=1",
         f"trainer.total_training_steps={total_updates}",
         f"trainer.resume_mode={args.resume}",
+        f"trainer.restart_after_checkpoint={str(all200_mode)}",
+        f"trainer.skip_val_before_train_on_resume={str(all200_mode)}",
+        f"trainer.shutdown_local_ray_on_exit={str(all200_mode)}",
         f"trainer.default_local_dir={checkpoint_root}",
         f"trainer.rollout_data_dir={evidence_root / 'rollouts'}",
         f"trainer.validation_data_dir={evidence_root / 'validation'}",
@@ -342,13 +348,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("all-200 mode forbids legacy --task-ids and separate same-prompt-control arms")
         if args.iterations != 5 or args.batch_size != 4:
             raise ValueError("the canonical all-200 run requires --iterations=5 and --batch-size=4")
+        args.resume = args.resume or "auto"
+        if args.resume != "auto":
+            raise ValueError("the canonical all-200 segmented run requires --resume=auto")
         if args.updates != 1:
             raise ValueError("--updates is a legacy fixed-40 option and must remain 1 in all-200 mode")
         if args.learning_rate is not None:
             raise ValueError("all-200 mode uses --warmup-target-lr and --final-lr, not --learning-rate")
         args.optimizer = args.optimizer or "adam"
         args.weight_decay = 0.0
-        args.resume = args.resume or "auto"
         if args.optimizer != "adam" or args.weight_decay != 0.0:
             raise ValueError("the canonical all-200 run requires strict Adam with zero weight decay")
         if not args.inline_same_prompt_diagnostics:
@@ -491,11 +499,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
         for task_id in train_ids
     ]
+    seed_sha = _git_sha(repo_root)
     provenance = {
         "status": "preflight-only",
         "mode": "june24_all200_train160_val40" if all200_mode else "june24_fixed40_smoke",
         "arm": args.arm,
-        "seed_sha": _git_sha(repo_root),
+        "seed_sha": seed_sha,
         "rlpaper_sha": args.rlpaper_sha,
         "bfcl_sha": _git_sha(args.bfcl_root.parent),
         "model": args.model,
@@ -545,9 +554,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "dynamic_hindsight_analysis": False,
         "same_prompt_control": args.same_prompt_control,
         "resume_mode": args.resume,
+        "checkpoint_process_mode": "fresh_process_per_iteration" if all200_mode else "single_process",
+        "rollout_gpu_memory_utilization": 0.40 if all200_mode else 0.45,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
+    previous_provenance = _read_json(metadata_path) if metadata_path.is_file() else {}
+    previous_seed_history = previous_provenance.get("seed_sha_history") or [
+        previous_provenance.get("seed_sha")
+    ]
+    seed_sha_history = []
+    for value in [*previous_seed_history, seed_sha]:
+        if value and value not in seed_sha_history:
+            seed_sha_history.append(value)
+    provenance["seed_sha_history"] = seed_sha_history
+    if plan_path.is_file():
+        previous_plan = _read_json(plan_path)
+        if previous_plan.get("command") != command:
+            preserved_plan = (
+                args.run_root / "metadata" / f"{args.arm}_plan_before_{seed_sha[:12]}.json"
+            )
+            if not preserved_plan.exists():
+                _write_json(preserved_plan, previous_plan)
     _write_json(metadata_path, provenance)
     _write_json(plan_path, {"command": command, "provenance": provenance})
     print(
@@ -561,17 +589,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         log_path = args.run_root / "logs" / f"{args.arm}_train.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_mode = "a" if args.resume == "auto" and log_path.is_file() else "w"
-        with log_path.open(log_mode, encoding="utf-8") as log:
+        if log_mode == "w":
+            log_path.write_text("", encoding="utf-8")
+        with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\nSEED_BFCL_LAUNCH resume={args.resume} total_updates={total_updates}\n")
-            result = subprocess.run(
-                command,
+        if all200_mode:
+            run_checkpoint_segments(
+                command=command,
                 cwd=repo_root,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
+                log_path=log_path,
+                checkpoint_root=args.run_root / "checkpoints" / args.arm,
+                history_path=args.run_root / "metadata" / f"{args.arm}_segment_history.json",
+                total_updates=total_updates,
+                updates_per_segment=updates_per_iteration,
+                seed_sha=seed_sha,
+                existing_checkpoint_seed_sha=provenance["seed_sha_history"][0],
             )
-        if result.returncode != 0:
-            raise RuntimeError(f"SEED training failed with exit code {result.returncode}; see {log_path}")
+        else:
+            with log_path.open("a", encoding="utf-8") as log:
+                result = subprocess.run(
+                    command,
+                    cwd=repo_root,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            if result.returncode != 0:
+                raise RuntimeError(f"SEED training failed with exit code {result.returncode}; see {log_path}")
         provenance["status"] = "training-finished"
         provenance["training_log"] = str(log_path)
         _write_json(metadata_path, provenance)

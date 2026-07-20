@@ -341,6 +341,10 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
+  # BFCL single-GPU jobs can intentionally recycle Ray/vLLM after each persisted boundary.
+  restart_after_checkpoint: False
+  skip_val_before_train_on_resume: False
+  shutdown_local_ray_on_exit: False
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or disable or resume_path if resume_from_path is set
   resume_from_path: null

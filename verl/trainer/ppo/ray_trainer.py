@@ -3363,10 +3363,18 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        resumed_from_checkpoint = self.global_steps > 0
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        skip_resume_validation = resumed_from_checkpoint and self.config.trainer.get(
+            "skip_val_before_train_on_resume", False
+        )
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.get("val_before_train", True)
+            and not skip_resume_validation
+        ):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -3385,6 +3393,7 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                restart_after_checkpoint = False
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
@@ -3810,6 +3819,10 @@ class RayPPOTrainer:
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
+                        restart_after_checkpoint = (
+                            self.config.trainer.get("restart_after_checkpoint", False)
+                            and not is_last_step
+                        )
 
                 # training metrics
                 metrics.update(
@@ -3831,6 +3844,13 @@ class RayPPOTrainer:
 
                 progress_bar.update(1)
                 self.global_steps += 1
+                if restart_after_checkpoint:
+                    pprint(
+                        "SEED_BFCL_CHECKPOINT_PROCESS_RESTART "
+                        f"checkpoint_step={self.global_steps - 1}"
+                    )
+                    progress_bar.close()
+                    return
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()

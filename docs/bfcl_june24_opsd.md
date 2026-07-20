@@ -104,7 +104,7 @@ python scripts/build_june24_all200_skill_bank.py \
   --allow-repaired-task-id multi_turn_base_169
 ```
 
-Preflight or execute the continuous five-iteration job:
+Preflight or execute the logical five-iteration job:
 
 ```bash
 python examples/seed_trainer/run_bfcl_opsd.py \
@@ -133,6 +133,16 @@ single optimizer step. Update evidence records exact task order, iteration and
 batch coordinates, class-level metrics, token/mask hashes, LR, gradients, and
 before/after LoRA hashes. Resume restores the model, Adam, scheduler, actor and
 driver RNG state, and the stateful data position.
+
+On a single A100, the launcher intentionally ends the Ray/vLLM process after
+each intermediate checkpoint and starts a clean process for the next
+iteration. This avoids vLLM sleep-pool accumulation across checkpoint-time
+validation while leaving the 800-row order and the 200-step learning-rate
+schedule unchanged. Every segment must advance by exactly 40 updates or the
+launcher fails; `metadata/privileged_june24_segment_history.json` records the
+checkpoint and SEED SHA used for each segment. Resumed segments skip the
+already-recorded boundary validation, so validation still occurs exactly at
+steps 0/40/80/120/160/200.
 
 Inline control diagnostics rescore the exact same response tokens under the
 ordinary prompt but never contribute that control signal to the gradient.
