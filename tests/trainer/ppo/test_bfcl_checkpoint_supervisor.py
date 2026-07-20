@@ -87,6 +87,16 @@ def test_segment_evidence_accepts_recovered_initial_checkpoint(tmp_path: Path):
             "seed_sha": "original",
         }
     ]
+    segments.append(
+        {
+            "kind": "training_segment",
+            "checkpoint_before": 40,
+            "expected_checkpoint": 80,
+            "checkpoint_after": 40,
+            "returncode": 1,
+            "seed_sha": "recovery",
+        }
+    )
     for before in (40, 80, 120, 160):
         segments.append(
             {
@@ -104,4 +114,5 @@ def test_segment_evidence_accepts_recovered_initial_checkpoint(tmp_path: Path):
     )
 
     evidence = _segment_evidence(path, seed_sha_history=["original", "recovery"])
-    assert len(evidence["segments"]) == 5
+    assert len(evidence["segments"]) == 6
+    assert evidence["validation"]["failed_attempt_count"] == 1

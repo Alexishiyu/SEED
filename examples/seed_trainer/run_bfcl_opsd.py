@@ -160,7 +160,7 @@ def _hydra_command(
 ) -> list[str]:
     total_model_len = args.max_prompt_length + args.max_response_length
     all200_mode = args.cohort_manifest is not None
-    rollout_gpu_memory_utilization = 0.40 if all200_mode else 0.45
+    rollout_gpu_memory_utilization = 0.41 if all200_mode else 0.45
     checkpoint_root = args.run_root / "checkpoints" / args.arm
     evidence_root = args.run_root / "evidence" / args.arm
     task_csv = ",".join(task_ids)
@@ -555,7 +555,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "same_prompt_control": args.same_prompt_control,
         "resume_mode": args.resume,
         "checkpoint_process_mode": "fresh_process_per_iteration" if all200_mode else "single_process",
-        "rollout_gpu_memory_utilization": 0.40 if all200_mode else 0.45,
+        "rollout_gpu_memory_utilization": 0.41 if all200_mode else 0.45,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"

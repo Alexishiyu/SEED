@@ -89,14 +89,20 @@ def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, A
         raise RuntimeError("checkpoint-process segment history is empty")
 
     covered = set()
+    failed_attempt_count = 0
     for item in segments:
         kind = item.get("kind")
-        after = int(item.get("checkpoint_after") or -1)
-        before = int(item.get("checkpoint_before") or -1)
+        after = int(item.get("checkpoint_after", -1))
+        before = int(item.get("checkpoint_before", -1))
+        if item.get("seed_sha") not in seed_sha_history:
+            raise RuntimeError(f"unrecorded SEED SHA in segment history: {item.get('seed_sha')}")
         if kind == "training_segment":
-            expected = int(item.get("expected_checkpoint") or -1)
-            if int(item.get("returncode") or 0) != 0:
-                raise RuntimeError(f"checkpoint-process segment {before}->{after} failed")
+            expected = int(item.get("expected_checkpoint", -1))
+            if int(item.get("returncode", -1)) != 0:
+                failed_attempt_count += 1
+                if after not in (0, *CHECKPOINT_STEPS):
+                    raise RuntimeError(f"failed segment left a noncanonical checkpoint: {item}")
+                continue
             if expected != after or after - before != 40:
                 raise RuntimeError(f"checkpoint-process segment did not advance exactly 40 steps: {item}")
         elif kind == "adopted_existing_checkpoint":
@@ -106,15 +112,19 @@ def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, A
             raise RuntimeError(f"unknown checkpoint-process segment kind: {kind}")
         if after not in CHECKPOINT_STEPS:
             raise RuntimeError(f"noncanonical checkpoint in segment history: {after}")
-        if item.get("seed_sha") not in seed_sha_history:
-            raise RuntimeError(f"unrecorded SEED SHA in segment history: {item.get('seed_sha')}")
         covered.add(after)
 
     if covered != set(CHECKPOINT_STEPS):
         raise RuntimeError(
             f"segment history does not cover every checkpoint: expected={CHECKPOINT_STEPS}, got={sorted(covered)}"
         )
-    return payload
+    return {
+        **payload,
+        "validation": {
+            "successful_checkpoint_coverage": sorted(covered),
+            "failed_attempt_count": failed_attempt_count,
+        },
+    }
 
 
 def _update_evidence(
