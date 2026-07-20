@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from examples.seed_trainer._common.bfcl_checkpoint_supervisor import (
+    archive_uncheckpointed_evidence,
     checkpoint_step,
     run_checkpoint_segments,
 )
@@ -77,6 +78,72 @@ def test_segment_supervisor_fails_when_process_does_not_advance(tmp_path: Path):
         )
 
 
+def test_archive_uncheckpointed_evidence_preserves_checkpointed_rows(tmp_path: Path):
+    evidence = tmp_path / "evidence"
+    for directory in ("updates", "rollouts", "validation"):
+        (evidence / directory).mkdir(parents=True)
+    (evidence / "updates" / "step_000080.json").write_text("{}\n", encoding="utf-8")
+    (evidence / "updates" / "step_000081.json").write_text("{}\n", encoding="utf-8")
+    (evidence / "rollouts" / "80.jsonl").write_text("{}\n", encoding="utf-8")
+    (evidence / "rollouts" / "115.jsonl").write_text("{}\n", encoding="utf-8")
+    (evidence / "validation" / "global_step_000080.json").write_text("{}\n", encoding="utf-8")
+    (evidence / "validation" / "global_step_000120.json").write_text("{}\n", encoding="utf-8")
+    (evidence / "trainable_checksum.json").write_text(
+        json.dumps({"global_step": 115}), encoding="utf-8"
+    )
+
+    record = archive_uncheckpointed_evidence(
+        evidence_root=evidence,
+        checkpoint=80,
+        timestamp_utc="20260720T120000Z",
+    )
+
+    assert record is not None
+    assert len(record["moved"]) == 4
+    assert (evidence / "updates" / "step_000080.json").is_file()
+    assert (evidence / "rollouts" / "80.jsonl").is_file()
+    assert (evidence / "validation" / "global_step_000080.json").is_file()
+    archive = evidence / "recovery_archive" / "uncheckpointed_after_step_80_20260720T120000Z"
+    assert (archive / "updates" / "step_000081.json").is_file()
+    assert (archive / "rollouts" / "115.jsonl").is_file()
+    assert (archive / "validation" / "global_step_000120.json").is_file()
+    assert (archive / "trainable_checksum.json").is_file()
+    assert (archive / "manifest.json").is_file()
+
+
+def test_segment_supervisor_accepts_ten_update_recovery_boundaries(tmp_path: Path):
+    checkpoint_root = tmp_path / "checkpoints"
+    _write_checkpoint(checkpoint_root, 80)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        before = checkpoint_step(checkpoint_root)
+        calls.append(before)
+        _write_checkpoint(checkpoint_root, before + 10)
+        return SimpleNamespace(returncode=0)
+
+    history = run_checkpoint_segments(
+        command=["python", "trainer.py"],
+        cwd=tmp_path,
+        log_path=tmp_path / "train.log",
+        checkpoint_root=checkpoint_root,
+        history_path=tmp_path / "segment_history.json",
+        total_updates=120,
+        updates_per_segment=10,
+        seed_sha="recovery",
+        run_process=fake_run,
+    )
+
+    assert calls == [80, 90, 100, 110]
+    assert checkpoint_step(checkpoint_root) == 120
+    assert [item["checkpoint_after"] for item in history if item["kind"] == "training_segment"] == [
+        90,
+        100,
+        110,
+        120,
+    ]
+
+
 def test_segment_evidence_accepts_recovered_initial_checkpoint(tmp_path: Path):
     path = tmp_path / "segment_history.json"
     segments = [
@@ -116,3 +183,32 @@ def test_segment_evidence_accepts_recovered_initial_checkpoint(tmp_path: Path):
     evidence = _segment_evidence(path, seed_sha_history=["original", "recovery"])
     assert len(evidence["segments"]) == 6
     assert evidence["validation"]["failed_attempt_count"] == 1
+
+
+def test_segment_evidence_accepts_mixed_legacy_and_recovery_intervals(tmp_path: Path):
+    path = tmp_path / "segment_history.json"
+    boundaries = [(0, 40), (40, 80), (80, 90), (90, 100), (100, 110), (110, 120), (120, 160), (160, 200)]
+    segments = [
+        {
+            "kind": "training_segment",
+            "checkpoint_before": before,
+            "expected_checkpoint": after,
+            "checkpoint_after": after,
+            "returncode": 0,
+            "seed_sha": "recovery",
+        }
+        for before, after in boundaries
+    ]
+    path.write_text(
+        json.dumps({"schema_version": "seed.bfcl.segment_history.v1", "segments": segments}),
+        encoding="utf-8",
+    )
+
+    evidence = _segment_evidence(
+        path,
+        seed_sha_history=["recovery"],
+        checkpoint_updates=10,
+    )
+
+    assert evidence["validation"]["checkpoint_updates"] == 10
+    assert evidence["validation"]["iteration_checkpoint_coverage"] == [40, 80, 120, 160, 200]

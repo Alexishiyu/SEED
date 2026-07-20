@@ -10,7 +10,11 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from examples.seed_trainer._common.bfcl_checkpoint_supervisor import run_checkpoint_segments
+from examples.seed_trainer._common.bfcl_checkpoint_supervisor import (
+    archive_uncheckpointed_evidence,
+    checkpoint_step,
+    run_checkpoint_segments,
+)
 from agent_system.environments.env_package.bfcl.envs import (
     BFCLWorker,
     hydrate_task,
@@ -160,6 +164,7 @@ def _hydra_command(
 ) -> list[str]:
     total_model_len = args.max_prompt_length + args.max_response_length
     all200_mode = args.cohort_manifest is not None
+    checkpoint_updates = args.checkpoint_updates if all200_mode else updates_per_iteration
     rollout_gpu_memory_utilization = 0.41 if all200_mode else 0.45
     checkpoint_root = args.run_root / "checkpoints" / args.arm
     evidence_root = args.run_root / "evidence" / args.arm
@@ -251,7 +256,7 @@ def _hydra_command(
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
         "trainer.balance_batch=False",
-        f"trainer.save_freq={updates_per_iteration}",
+        f"trainer.save_freq={checkpoint_updates}",
         "trainer.total_epochs=1",
         f"trainer.total_training_steps={total_updates}",
         f"trainer.resume_mode={args.resume}",
@@ -281,7 +286,7 @@ def _hydra_command(
                 f"actor_rollout_ref.actor.optim.final_lr={args.final_lr}",
                 "trainer.val_before_train=True",
                 f"trainer.test_freq={updates_per_iteration}",
-                "trainer.max_actor_ckpt_to_keep=5",
+                f"trainer.max_actor_ckpt_to_keep={total_updates // checkpoint_updates}",
             ]
         )
     return command
@@ -310,6 +315,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=None, help="Legacy fixed-40 alias for --final-lr")
     parser.add_argument("--max-prompt-length", type=int, default=16384)
     parser.add_argument("--max-response-length", type=int, default=2048)
+    parser.add_argument(
+        "--checkpoint-updates",
+        type=int,
+        default=10,
+        help="All-200 recovery checkpoint/process interval; must divide 40",
+    )
     parser.add_argument("--resume", choices=("disable", "auto"), default=None)
     parser.add_argument("--rlpaper-sha", default=os.environ.get("RLPAPER_SHA"))
     parser.add_argument("--same-prompt-control", action="store_true")
@@ -348,6 +359,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("all-200 mode forbids legacy --task-ids and separate same-prompt-control arms")
         if args.iterations != 5 or args.batch_size != 4:
             raise ValueError("the canonical all-200 run requires --iterations=5 and --batch-size=4")
+        if args.checkpoint_updates <= 0 or 40 % args.checkpoint_updates:
+            raise ValueError("--checkpoint-updates must be a positive divisor of 40")
         args.resume = args.resume or "auto"
         if args.resume != "auto":
             raise ValueError("the canonical all-200 segmented run requires --resume=auto")
@@ -547,6 +560,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             updates_per_iteration * iteration
             for iteration in range(1, (args.iterations if all200_mode else 1) + 1)
         ],
+        "checkpoint_updates": args.checkpoint_updates if all200_mode else updates_per_iteration,
+        "checkpoint_schedule": (
+            list(range(args.checkpoint_updates, total_updates + 1, args.checkpoint_updates))
+            if all200_mode
+            else [total_updates]
+        ),
         "validation_steps": [0, 40, 80, 120, 160, 200] if all200_mode else [],
         "opd": {"only": True, "loss_coef": 1.0, "gate_beta": 5.0},
         "inline_same_prompt_diagnostics": args.inline_same_prompt_diagnostics,
@@ -554,7 +573,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "dynamic_hindsight_analysis": False,
         "same_prompt_control": args.same_prompt_control,
         "resume_mode": args.resume,
-        "checkpoint_process_mode": "fresh_process_per_iteration" if all200_mode else "single_process",
+        "checkpoint_process_mode": (
+            "fresh_process_per_recovery_checkpoint" if all200_mode else "single_process"
+        ),
         "rollout_gpu_memory_utilization": 0.41 if all200_mode else 0.45,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
@@ -568,6 +589,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if value and value not in seed_sha_history:
             seed_sha_history.append(value)
     provenance["seed_sha_history"] = seed_sha_history
+    provenance["uncheckpointed_evidence_archives"] = list(
+        previous_provenance.get("uncheckpointed_evidence_archives") or []
+    )
     if plan_path.is_file():
         previous_plan = _read_json(plan_path)
         if previous_plan.get("command") != command:
@@ -594,14 +618,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\nSEED_BFCL_LAUNCH resume={args.resume} total_updates={total_updates}\n")
         if all200_mode:
+            checkpoint_root = args.run_root / "checkpoints" / args.arm
+            resumable_step = checkpoint_step(checkpoint_root)
+            archive_record = archive_uncheckpointed_evidence(
+                evidence_root=args.run_root / "evidence" / args.arm,
+                checkpoint=resumable_step,
+            )
+            if archive_record is not None:
+                archives = list(provenance.get("uncheckpointed_evidence_archives") or [])
+                archives.append(archive_record)
+                provenance["uncheckpointed_evidence_archives"] = archives
+                _write_json(metadata_path, provenance)
+                print(
+                    "SEED_BFCL_UNCHECKPOINTED_EVIDENCE_ARCHIVED "
+                    f"checkpoint={resumable_step} archive={archive_record['archive_root']} "
+                    f"files={len(archive_record['moved'])}",
+                    flush=True,
+                )
             run_checkpoint_segments(
                 command=command,
                 cwd=repo_root,
                 log_path=log_path,
-                checkpoint_root=args.run_root / "checkpoints" / args.arm,
+                checkpoint_root=checkpoint_root,
                 history_path=args.run_root / "metadata" / f"{args.arm}_segment_history.json",
                 total_updates=total_updates,
-                updates_per_segment=updates_per_iteration,
+                updates_per_segment=args.checkpoint_updates,
                 seed_sha=seed_sha,
                 existing_checkpoint_seed_sha=provenance["seed_sha_history"][0],
             )

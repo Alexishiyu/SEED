@@ -43,16 +43,29 @@ def _require_finite(value: Any, label: str) -> float:
     return result
 
 
-def _checkpoint_evidence(checkpoint_root: Path) -> list[dict[str, Any]]:
+def _checkpoint_evidence(
+    checkpoint_root: Path,
+    *,
+    checkpoint_updates: int = 40,
+) -> list[dict[str, Any]]:
     observed_steps = sorted(
         int(path.name.rsplit("_", 1)[-1])
         for path in checkpoint_root.glob("global_step_*")
         if path.is_dir()
     )
-    if observed_steps != list(CHECKPOINT_STEPS):
-        raise RuntimeError(f"expected iteration checkpoints {CHECKPOINT_STEPS}, got {observed_steps}")
+    if checkpoint_updates <= 0 or 40 % checkpoint_updates:
+        raise RuntimeError(f"invalid recovery checkpoint interval: {checkpoint_updates}")
+    if not set(CHECKPOINT_STEPS).issubset(observed_steps):
+        raise RuntimeError(f"missing iteration checkpoints {CHECKPOINT_STEPS}; got {observed_steps}")
+    invalid_steps = [
+        step
+        for step in observed_steps
+        if step <= 0 or step > CHECKPOINT_STEPS[-1] or step % checkpoint_updates
+    ]
+    if invalid_steps:
+        raise RuntimeError(f"noncanonical recovery checkpoints: {invalid_steps}")
     evidence = []
-    for step in CHECKPOINT_STEPS:
+    for step in observed_steps:
         root = checkpoint_root / f"global_step_{step}"
         actor = root / "actor"
         adapter = actor / "lora_adapter"
@@ -78,7 +91,12 @@ def _checkpoint_evidence(checkpoint_root: Path) -> list[dict[str, Any]]:
     return evidence
 
 
-def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, Any]:
+def _segment_evidence(
+    path: Path,
+    *,
+    seed_sha_history: list[str],
+    checkpoint_updates: int = 40,
+) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError(f"missing checkpoint-process segment history: {path}")
     payload = _json(path)
@@ -87,6 +105,9 @@ def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, A
     segments = payload.get("segments")
     if not isinstance(segments, list) or not segments:
         raise RuntimeError("checkpoint-process segment history is empty")
+    if checkpoint_updates <= 0 or 40 % checkpoint_updates:
+        raise RuntimeError(f"invalid recovery checkpoint interval: {checkpoint_updates}")
+    allowed_steps = set(range(checkpoint_updates, CHECKPOINT_STEPS[-1] + 1, checkpoint_updates))
 
     covered = set()
     failed_attempt_count = 0
@@ -100,21 +121,25 @@ def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, A
             expected = int(item.get("expected_checkpoint", -1))
             if int(item.get("returncode", -1)) != 0:
                 failed_attempt_count += 1
-                if after not in (0, *CHECKPOINT_STEPS):
+                if after not in ({0} | allowed_steps):
                     raise RuntimeError(f"failed segment left a noncanonical checkpoint: {item}")
                 continue
-            if expected != after or after - before != 40:
-                raise RuntimeError(f"checkpoint-process segment did not advance exactly 40 steps: {item}")
+            delta = after - before
+            if expected != after or delta not in {checkpoint_updates, 40}:
+                raise RuntimeError(
+                    "checkpoint-process segment did not advance by the configured recovery "
+                    f"interval or the legacy 40-step interval: {item}"
+                )
         elif kind == "adopted_existing_checkpoint":
             if before != after:
                 raise RuntimeError(f"adopted checkpoint history is inconsistent: {item}")
         else:
             raise RuntimeError(f"unknown checkpoint-process segment kind: {kind}")
-        if after not in CHECKPOINT_STEPS:
+        if after not in allowed_steps:
             raise RuntimeError(f"noncanonical checkpoint in segment history: {after}")
         covered.add(after)
 
-    if covered != set(CHECKPOINT_STEPS):
+    if not set(CHECKPOINT_STEPS).issubset(covered):
         raise RuntimeError(
             f"segment history does not cover every checkpoint: expected={CHECKPOINT_STEPS}, got={sorted(covered)}"
         )
@@ -122,6 +147,8 @@ def _segment_evidence(path: Path, *, seed_sha_history: list[str]) -> dict[str, A
         **payload,
         "validation": {
             "successful_checkpoint_coverage": sorted(covered),
+            "iteration_checkpoint_coverage": list(CHECKPOINT_STEPS),
+            "checkpoint_updates": checkpoint_updates,
             "failed_attempt_count": failed_attempt_count,
         },
     }
@@ -377,10 +404,15 @@ def main() -> None:
         schedules=schedules,
         classification_by_id=classification_by_id,
     )
-    checkpoints = _checkpoint_evidence(run_root / "checkpoints" / "privileged_june24")
+    checkpoint_updates = int(provenance.get("checkpoint_updates") or 40)
+    checkpoints = _checkpoint_evidence(
+        run_root / "checkpoints" / "privileged_june24",
+        checkpoint_updates=checkpoint_updates,
+    )
     segment_history = _segment_evidence(
         run_root / "metadata" / "privileged_june24_segment_history.json",
         seed_sha_history=[str(value) for value in provenance.get("seed_sha_history") or [provenance["seed_sha"]]],
+        checkpoint_updates=checkpoint_updates,
     )
     for checkpoint in checkpoints[:-1]:
         next_step = checkpoint["global_step"] + 1

@@ -113,7 +113,7 @@ python examples/seed_trainer/run_bfcl_opsd.py \
   --split-manifest /run/inputs/june24_train160_val40_split.json \
   --run-root /content/drive/MyDrive/bfcl_qwen_experiment/seed_opsd_colab/june24_all200_train160_val40_<timestamp> \
   --bfcl-root /path/to/gorilla/berkeley-function-call-leaderboard \
-  --iterations 5 --batch-size 4 --optimizer adam \
+  --iterations 5 --batch-size 4 --checkpoint-updates 10 --optimizer adam \
   --warmup-updates 67 --warmup-target-lr 1e-7 --final-lr 1e-6 \
   --inline-same-prompt-diagnostics --resume auto \
   --rlpaper-sha <sha>
@@ -121,8 +121,8 @@ python examples/seed_trainer/run_bfcl_opsd.py \
 
 This materializes 800 ordered training rows: 160 tasks once in each of five
 iterations. It performs 40 updates per iteration, validates the ordinary BFCL
-prompt at steps 0/40/80/120/160/200, and keeps resumable checkpoints at the
-five nonzero validation steps. Strict Adam uses betas `(0.9, 0.999)`, epsilon
+prompt at steps 0/40/80/120/160/200, and keeps resumable recovery checkpoints
+every 10 updates, including the five nonzero validation steps. Strict Adam uses betas `(0.9, 0.999)`, epsilon
 `1e-8`, and zero weight decay. The first 67 updates rise from zero to `1e-7`;
 the remaining updates rise linearly to `1e-6`.
 
@@ -135,14 +135,18 @@ before/after LoRA hashes. Resume restores the model, Adam, scheduler, actor and
 driver RNG state, and the stateful data position.
 
 On a single A100, the launcher intentionally ends the Ray/vLLM process after
-each intermediate checkpoint and starts a clean process for the next
-iteration. This avoids vLLM sleep-pool accumulation across checkpoint-time
-validation while leaving the 800-row order and the 200-step learning-rate
-schedule unchanged. Every segment must advance by exactly 40 updates or the
-launcher fails; `metadata/privileged_june24_segment_history.json` records the
-checkpoint and SEED SHA used for each segment. Resumed segments skip the
-already-recorded boundary validation, so validation still occurs exactly at
-steps 0/40/80/120/160/200.
+each 10-update recovery checkpoint and starts a clean process for the next
+segment. This avoids vLLM sleep-pool accumulation and bounds the work lost to a
+Colab runtime cutoff while leaving the 800-row order, five 40-update
+iterations, validation boundaries, and 200-step learning-rate schedule
+unchanged. Every new segment must advance by exactly 10 updates; historical
+40-update segments remain valid migration evidence.
+`metadata/privileged_june24_segment_history.json` records the checkpoint and
+SEED SHA used for each segment. If per-update evidence extends beyond the last
+atomic checkpoint after a runtime loss, the launcher archives those orphaned
+files under `evidence/privileged_june24/recovery_archive/` before resuming.
+Resumed segments skip already-recorded boundary validation, so validation
+still occurs exactly at steps 0/40/80/120/160/200.
 
 Inline control diagnostics rescore the exact same response tokens under the
 ordinary prompt but never contribute that control signal to the gradient.

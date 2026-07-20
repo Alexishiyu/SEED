@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Any, Callable, Sequence
 
 
 _CHECKPOINT_DIR_RE = re.compile(r"global_step_(\d+)$")
+_UPDATE_FILE_RE = re.compile(r"step_(\d+)\.json$")
+_ROLLOUT_FILE_RE = re.compile(r"(\d+)\.jsonl$")
+_VALIDATION_FILE_RE = re.compile(r"global_step_(\d+)\.json$")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -70,6 +74,72 @@ def checkpoint_step(checkpoint_root: Path) -> int:
     if missing:
         raise RuntimeError(f"checkpoint global_step_{step} is incomplete; missing={missing}")
     return step
+
+
+def archive_uncheckpointed_evidence(
+    *,
+    evidence_root: Path,
+    checkpoint: int,
+    timestamp_utc: str | None = None,
+) -> dict[str, Any] | None:
+    """Move evidence newer than the resumable checkpoint into a recovery archive.
+
+    A Colab reset can leave per-update diagnostics and rollout JSONL files beyond
+    the last atomic model/optimizer checkpoint.  Those files describe weights
+    that no longer exist and must not be mixed with a deterministic resume.
+    """
+
+    if checkpoint < 0:
+        raise ValueError("checkpoint must be non-negative")
+    evidence_root = evidence_root.expanduser().resolve()
+    candidates: list[tuple[Path, Path]] = []
+    for relative_dir, pattern in (
+        (Path("updates"), _UPDATE_FILE_RE),
+        (Path("rollouts"), _ROLLOUT_FILE_RE),
+        (Path("validation"), _VALIDATION_FILE_RE),
+    ):
+        source_dir = evidence_root / relative_dir
+        if not source_dir.is_dir():
+            continue
+        for source in source_dir.iterdir():
+            match = pattern.fullmatch(source.name)
+            if match and source.is_file() and int(match.group(1)) > checkpoint:
+                candidates.append((source, relative_dir / source.name))
+
+    checksum_path = evidence_root / "trainable_checksum.json"
+    if checksum_path.is_file():
+        checksum = json.loads(checksum_path.read_text(encoding="utf-8"))
+        if int(checksum.get("global_step", -1)) > checkpoint:
+            candidates.append((checksum_path, Path(checksum_path.name)))
+
+    if not candidates:
+        return None
+
+    timestamp = timestamp_utc or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_root = (
+        evidence_root
+        / "recovery_archive"
+        / f"uncheckpointed_after_step_{checkpoint}_{timestamp}"
+    )
+    if archive_root.exists():
+        raise RuntimeError(f"recovery archive already exists: {archive_root}")
+
+    moved: list[dict[str, Any]] = []
+    for source, relative_target in sorted(candidates, key=lambda item: item[1].as_posix()):
+        target = archive_root / relative_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        moved.append({"source": str(source), "archived": str(target)})
+
+    record = {
+        "schema_version": "seed.bfcl.uncheckpointed_archive.v1",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "checkpoint": checkpoint,
+        "archive_root": str(archive_root),
+        "moved": moved,
+    }
+    _write_json(archive_root / "manifest.json", record)
+    return record
 
 
 def run_checkpoint_segments(
