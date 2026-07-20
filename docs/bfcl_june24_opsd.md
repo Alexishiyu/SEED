@@ -145,9 +145,11 @@ For LoRA runs, recovery restores the adapter from the checkpoint's
 `lora_adapter/adapter_model.safetensors` and restores Adam, scheduler, RNG, and
 dataset position from their ordinary checkpoint files. The frozen base model is
 reloaded from the pinned Hugging Face model rather than reread from the roughly
-18 GB DriveFS model shard. The full model shard remains mandatory and preserved
-for conventional resumability/export evidence; update-level checksum continuity
-must prove that the adapter-only recovery is exact.
+18 GB DriveFS model shard. Because that shard duplicates only frozen parameters
+and is not reliably durable on Colab DriveFS, LoRA-only checkpoints deliberately
+omit it. The adapter, optimizer, scheduler/RNG, data position, pinned base-model
+revision, and update-level checksum continuity are the authoritative resumability
+evidence. The final merged Hugging Face export remains a separate required stage.
 `metadata/privileged_june24_segment_history.json` records the checkpoint and
 SEED SHA used for each segment. If per-update evidence extends beyond the last
 atomic checkpoint after a runtime loss, the launcher archives those orphaned

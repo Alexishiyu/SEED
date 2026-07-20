@@ -70,19 +70,26 @@ def _checkpoint_evidence(
         actor = root / "actor"
         adapter = actor / "lora_adapter"
         required_patterns = {
-            "model": "model_world_size_*_rank_*.pt",
             "optimizer": "optim_world_size_*_rank_*.pt",
             "extra": "extra_state_world_size_*_rank_*.pt",
         }
         missing = [label for label, pattern in required_patterns.items() if not list(actor.glob(pattern))]
-        if missing or not (root / "data.pt").is_file() or not (adapter / "adapter_config.json").is_file():
+        if (
+            missing
+            or not (root / "data.pt").is_file()
+            or not (adapter / "adapter_config.json").is_file()
+            or not (adapter / "adapter_model.safetensors").is_file()
+        ):
             raise RuntimeError(f"checkpoint {step} is not resumable or exportable; missing={missing}")
+        full_model_shards = sorted(actor.glob("model_world_size_*_rank_*.pt"))
         evidence.append(
             {
                 "global_step": step,
                 "path": str(root),
                 "adapter_sha256": _tree_sha256(adapter),
                 "resumable": True,
+                "resume_model_source": "pinned_base_plus_lora_adapter",
+                "full_model_shard_present": bool(full_model_shards),
             }
         )
     adapter_hashes = [item["adapter_sha256"] for item in evidence]

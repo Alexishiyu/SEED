@@ -217,7 +217,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
-                model_state_dict = self.model.state_dict()
+                # LoRA-only BFCL recovery reconstructs the frozen base model from
+                # the pinned Hugging Face revision and restores every trainable
+                # tensor from ``lora_adapter``.  Writing the otherwise redundant
+                # single-rank model shard costs roughly 18 GB per checkpoint and
+                # is not durable on Colab DriveFS.  Optimizer/scheduler/RNG state
+                # is still saved below, and the worker writes the adapter before
+                # the trainer publishes the atomic checkpoint marker.
+                model_state_dict = None if self.lora_only_resume else self.model.state_dict()
                 optimizer_state_dict = self.optimizer.state_dict() if self.optimizer is not None else None
                 lr_scheduler_state_dict = self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
 
@@ -229,10 +236,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
-                print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}")
+                if self.lora_only_resume:
+                    print(
+                        f"[rank-{self.rank}]: SEED_LORA_ONLY_CHECKPOINT_SAVE "
+                        f"skipping_frozen_model_shard={os.path.abspath(model_path)}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}")
                 print(f"[rank-{self.rank}]: Saving optim to {os.path.abspath(optim_path)}")
                 print(f"[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}")
-                torch.save(model_state_dict, model_path)
+                if model_state_dict is not None:
+                    torch.save(model_state_dict, model_path)
                 torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
                 torch.save(extra_state_dict, extra_path)
 

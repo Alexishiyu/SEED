@@ -23,7 +23,13 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def checkpoint_step(checkpoint_root: Path) -> int:
-    """Return the latest complete resumable checkpoint, or fail on partial state."""
+    """Return the latest complete LoRA-resumable checkpoint.
+
+    The frozen base model is reconstructed from the pinned model revision.  The
+    adapter is therefore the complete trainable model state; requiring a second
+    roughly 18 GB copy of the frozen base weights makes DriveFS recovery less
+    durable without adding any state needed by the LoRA-only loader.
+    """
 
     checkpoint_root = checkpoint_root.expanduser().resolve()
     marker = checkpoint_root / "latest_checkpointed_iteration.txt"
@@ -65,7 +71,6 @@ def checkpoint_step(checkpoint_root: Path) -> int:
     ]
     missing = [str(path) for path in required_files if not path.is_file()]
     for pattern in (
-        "model_world_size_*_rank_*.pt",
         "optim_world_size_*_rank_*.pt",
         "extra_state_world_size_*_rank_*.pt",
     ):

@@ -9,15 +9,19 @@ from examples.seed_trainer._common.bfcl_checkpoint_supervisor import (
     checkpoint_step,
     run_checkpoint_segments,
 )
-from examples.seed_trainer.collect_bfcl_opsd_five_pass_evidence import _segment_evidence
+from examples.seed_trainer.collect_bfcl_opsd_five_pass_evidence import (
+    _checkpoint_evidence,
+    _segment_evidence,
+)
 
 
-def _write_checkpoint(root: Path, step: int) -> None:
+def _write_checkpoint(root: Path, step: int, *, include_full_model: bool = True) -> None:
     actor = root / f"global_step_{step}" / "actor"
     adapter = actor / "lora_adapter"
     adapter.mkdir(parents=True)
     (root / f"global_step_{step}" / "data.pt").write_bytes(b"data")
-    (actor / "model_world_size_1_rank_0.pt").write_bytes(b"model")
+    if include_full_model:
+        (actor / "model_world_size_1_rank_0.pt").write_bytes(b"model")
     (actor / "optim_world_size_1_rank_0.pt").write_bytes(b"optim")
     (actor / "extra_state_world_size_1_rank_0.pt").write_bytes(b"extra")
     (adapter / "adapter_model.safetensors").write_bytes(b"lora")
@@ -30,6 +34,37 @@ def test_checkpoint_step_rejects_partial_atomic_state(tmp_path: Path):
     (root / "global_step_40").mkdir(parents=True)
     with pytest.raises(RuntimeError, match="without an atomic latest marker"):
         checkpoint_step(root)
+
+
+def test_checkpoint_step_accepts_lora_only_resumable_state(tmp_path: Path):
+    root = tmp_path / "checkpoints"
+    _write_checkpoint(root, 40, include_full_model=False)
+
+    assert checkpoint_step(root) == 40
+
+
+def test_checkpoint_step_rejects_missing_optimizer_state(tmp_path: Path):
+    root = tmp_path / "checkpoints"
+    _write_checkpoint(root, 40, include_full_model=False)
+    (root / "global_step_40" / "actor" / "optim_world_size_1_rank_0.pt").unlink()
+
+    with pytest.raises(RuntimeError, match="optim_world_size"):
+        checkpoint_step(root)
+
+
+def test_completion_evidence_accepts_lora_only_checkpoints(tmp_path: Path):
+    root = tmp_path / "checkpoints"
+    for step in (40, 80, 120, 160, 200):
+        _write_checkpoint(root, step, include_full_model=False)
+        adapter = root / f"global_step_{step}" / "actor" / "lora_adapter"
+        (adapter / "adapter_model.safetensors").write_bytes(f"lora-{step}".encode())
+
+    evidence = _checkpoint_evidence(root)
+
+    assert [item["global_step"] for item in evidence] == [40, 80, 120, 160, 200]
+    assert all(item["resumable"] for item in evidence)
+    assert all(item["resume_model_source"] == "pinned_base_plus_lora_adapter" for item in evidence)
+    assert not any(item["full_model_shard_present"] for item in evidence)
 
 
 def test_segment_supervisor_resumes_at_40_and_reaches_200(tmp_path: Path):
