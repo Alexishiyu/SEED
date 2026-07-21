@@ -40,8 +40,9 @@ def _bfcl_memory_profile(*, all200_mode: bool, batch_size: int) -> dict[str, obj
     batch64_mode = all200_mode and batch_size >= 64
     return {
         "rollout_gpu_memory_utilization": (
-            0.30 if batch64_mode else (0.41 if all200_mode else 0.45)
+            0.35 if batch64_mode else (0.41 if all200_mode else 0.45)
         ),
+        "actor_activation_offload": batch64_mode,
         "actor_param_offload": batch64_mode,
         "actor_optimizer_offload": batch64_mode,
     }
@@ -223,6 +224,8 @@ def _hydra_command(
         f"actor_rollout_ref.model.lora_alpha={args.lora_alpha}",
         "actor_rollout_ref.model.target_modules=all-linear",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        "actor_rollout_ref.model.enable_activation_offload="
+        f"{str(memory_profile['actor_activation_offload'])}",
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.actor.strategy=fsdp",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={args.batch_size}",
