@@ -164,3 +164,51 @@ They are debugging evidence, not a separately trained causal control arm. Use
 controller. It writes all inputs, validation curves, checkpoints, update-level
 token/hash evidence, the final merged export, and the completion report under
 one fresh Drive-backed run root.
+
+## Five-epoch 128/72 large-batch experiment
+
+The `128x72_b64` split profile is a separate deterministic experiment over the
+same audited 200-task authority. It keeps the original 40 validation tasks and
+adds the next 32 outcome-stratified SHA-ranked tasks to validation. The frozen
+training counts are `fixed=26`, `both_wrong=72`, `harmed=8`, and
+`both_correct=22`; validation counts are `14/40/5/13` in the same class order.
+
+Each of five epochs contains exactly two 64-task batches. Every batch produces
+one strict-Adam, zero-weight-decay update and an atomic resumable LoRA
+checkpoint, for 640 training rollouts and 10 updates/checkpoints total. This
+profile uses SEED's usual constant `1e-6` learning-rate behavior with no
+warmup; all OPD-only, prompt, model, LoRA, source-audit, and inline-control
+contracts remain unchanged. Validation covers all 72 held-out tasks at steps
+`0, 2, 4, 6, 8, 10` (432 validation rollouts).
+
+Build and preflight it with:
+
+```bash
+python scripts/build_june24_all200_skill_bank.py \
+  --pairwise-tasks-csv /drive/bfcl_qwen_pairwise_analysis/pairwise_tasks.csv \
+  --source-dir /drive/bfcl_qwen_experiment/a100_skill_sd_50_20260624_055240/skills_openai \
+  --source-dir /drive/bfcl_qwen_experiment/a100_skill_sd_150_50_199_20260624_063820/skills_openai \
+  --cohort-manifest /run/inputs/june24_all200_cohort.json \
+  --split-manifest /run/inputs/june24_train128_val72_b64_split.json \
+  --output /run/inputs/june24_train128_skill_bank.json \
+  --split-profile 128x72_b64 --batch-size 64 \
+  --allow-repaired-task-id multi_turn_base_56 \
+  --allow-repaired-task-id multi_turn_base_154 \
+  --allow-repaired-task-id multi_turn_base_169
+
+python examples/seed_trainer/run_bfcl_opsd.py \
+  --june24-skill-bank /run/inputs/june24_train128_skill_bank.json \
+  --cohort-manifest /run/inputs/june24_all200_cohort.json \
+  --split-manifest /run/inputs/june24_train128_val72_b64_split.json \
+  --run-root /content/drive/MyDrive/bfcl_qwen_experiment/seed_opsd_colab/june24_all200_train128_val72_b64_<timestamp> \
+  --bfcl-root /path/to/gorilla/berkeley-function-call-leaderboard \
+  --iterations 5 --batch-size 64 --checkpoint-updates 1 \
+  --optimizer adam --lr-schedule constant --final-lr 1e-6 \
+  --inline-same-prompt-diagnostics --resume auto --rlpaper-sha <sha>
+```
+
+Use `--execute --stop-after-update 1` for the Drive-backed batch-64 gate. After
+checkpoint 1 and its update evidence validate, rerun with `--execute` and no
+stop flag to resume the same optimizer, scheduler, RNG, dataset position, and
+adapter through checkpoint 10. The paired controller is
+`examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb`.

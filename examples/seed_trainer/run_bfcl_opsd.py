@@ -281,15 +281,27 @@ def _hydra_command(
             [
                 f"algorithm.seed.june24_cohort_manifest={args.cohort_manifest}",
                 f"algorithm.seed.june24_split_manifest={args.split_manifest}",
-                f"actor_rollout_ref.actor.optim.lr_warmup_steps={args.warmup_updates}",
-                "actor_rollout_ref.actor.optim.warmup_style=two_stage_linear",
-                f"actor_rollout_ref.actor.optim.warmup_target_lr={args.warmup_target_lr}",
-                f"actor_rollout_ref.actor.optim.final_lr={args.final_lr}",
                 "trainer.val_before_train=True",
                 f"trainer.test_freq={updates_per_iteration}",
                 f"trainer.max_actor_ckpt_to_keep={total_updates // checkpoint_updates}",
             ]
         )
+        if args.lr_schedule == "two_stage_linear":
+            command.extend(
+                [
+                    f"actor_rollout_ref.actor.optim.lr_warmup_steps={args.warmup_updates}",
+                    "actor_rollout_ref.actor.optim.warmup_style=two_stage_linear",
+                    f"actor_rollout_ref.actor.optim.warmup_target_lr={args.warmup_target_lr}",
+                    f"actor_rollout_ref.actor.optim.final_lr={args.final_lr}",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "actor_rollout_ref.actor.optim.lr_warmup_steps=0",
+                    "actor_rollout_ref.actor.optim.warmup_style=constant",
+                ]
+            )
     return command
 
 
@@ -313,6 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-updates", type=int, default=67)
     parser.add_argument("--warmup-target-lr", type=float, default=1e-7)
     parser.add_argument("--final-lr", type=float, default=1e-6)
+    parser.add_argument("--lr-schedule", choices=("constant", "two_stage_linear"), default=None)
     parser.add_argument("--learning-rate", type=float, default=None, help="Legacy fixed-40 alias for --final-lr")
     parser.add_argument("--max-prompt-length", type=int, default=16384)
     parser.add_argument("--max-response-length", type=int, default=2048)
@@ -327,6 +340,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--same-prompt-control", action="store_true")
     parser.add_argument("--inline-same-prompt-diagnostics", action="store_true")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--stop-after-update",
+        type=int,
+        default=None,
+        help="Execution-only gate: stop after this committed checkpoint, then resume the same run later",
+    )
     args = parser.parse_args()
     args.arm = "same_prompt_control" if args.same_prompt_control else "privileged_june24"
     return args
@@ -358,10 +377,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("--cohort-manifest requires --split-manifest")
         if args.task_ids is not None or args.same_prompt_control:
             raise ValueError("all-200 mode forbids legacy --task-ids and separate same-prompt-control arms")
-        if args.iterations != 5 or args.batch_size != 4:
-            raise ValueError("the canonical all-200 run requires --iterations=5 and --batch-size=4")
-        if args.checkpoint_updates <= 0 or 40 % args.checkpoint_updates:
-            raise ValueError("--checkpoint-updates must be a positive divisor of 40")
+        split_header = _read_json(args.split_manifest)
+        split_profile = str(split_header.get("split_profile") or "160x40_b4")
+        profile_contracts = {
+            "160x40_b4": {
+                "batch_size": 4,
+                "updates_per_iteration": 40,
+                "total_updates": 200,
+                "lr_schedule": "two_stage_linear",
+            },
+            "128x72_b64": {
+                "batch_size": 64,
+                "updates_per_iteration": 2,
+                "total_updates": 10,
+                "lr_schedule": "constant",
+            },
+        }
+        profile_contract = profile_contracts.get(split_profile)
+        if profile_contract is None:
+            raise ValueError(f"unsupported all-200 split profile: {split_profile}")
+        if args.iterations != 5 or args.batch_size != profile_contract["batch_size"]:
+            raise ValueError(
+                f"split profile {split_profile} requires --iterations=5 and "
+                f"--batch-size={profile_contract['batch_size']}"
+            )
+        if args.checkpoint_updates <= 0 or profile_contract["updates_per_iteration"] % args.checkpoint_updates:
+            raise ValueError(
+                "--checkpoint-updates must be a positive divisor of updates per iteration"
+            )
+        args.lr_schedule = args.lr_schedule or profile_contract["lr_schedule"]
+        if args.lr_schedule != profile_contract["lr_schedule"]:
+            raise ValueError(
+                f"split profile {split_profile} requires --lr-schedule={profile_contract['lr_schedule']}"
+            )
         args.resume = args.resume or "auto"
         if args.resume != "auto":
             raise ValueError("the canonical all-200 segmented run requires --resume=auto")
@@ -377,7 +425,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("the canonical all-200 run requires --inline-same-prompt-diagnostics")
 
         cohort_value = _read_json(args.cohort_manifest)
-        split_value = _read_json(args.split_manifest)
+        split_value = split_header
         classification_by_id = _classification_map(cohort_value)
         train_ids, validation_ids, schedules = validate_stratified_split_manifest(
             split_value,
@@ -386,8 +434,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         schedule_value = split_value["training_schedule"]
         total_updates = int(schedule_value["total_updates"])
         updates_per_iteration = int(schedule_value["updates_per_iteration"])
-        if total_updates != 200 or updates_per_iteration != 40:
-            raise ValueError("canonical all-200 training schedule must contain 200 updates in five groups of 40")
+        if (
+            total_updates != profile_contract["total_updates"]
+            or updates_per_iteration != profile_contract["updates_per_iteration"]
+        ):
+            raise ValueError(f"training schedule does not match split profile {split_profile}")
         bank = load_skill_bank(
             args.june24_skill_bank,
             cohort_manifest=args.cohort_manifest,
@@ -427,6 +478,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             classification_by_id=classification_by_id,
         )
         prompt_task_ids = train_ids
+        run_mode = (
+            "june24_all200_train128_val72_b64"
+            if split_profile == "128x72_b64"
+            else "june24_all200_train160_val40"
+        )
         manifest_provenance = {
             "cohort_manifest_path": str(args.cohort_manifest),
             "cohort_manifest_sha256": sha256_file(args.cohort_manifest),
@@ -475,6 +531,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         total_updates = 1
         updates_per_iteration = 1
         prompt_task_ids = train_ids
+        split_profile = None
+        run_mode = "june24_fixed40_smoke"
         manifest_provenance = {
             "fixed_manifest_path": str(args.fixed_manifest),
             "fixed_manifest_sha256": bank.fixed_manifest_sha256,
@@ -491,8 +549,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     args.run_root.mkdir(parents=True, exist_ok=True)
-    train_path = args.run_root / "inputs" / ("bfcl_train160_x5.parquet" if all200_mode else "bfcl_fixed4.parquet")
-    validation_path = args.run_root / "inputs" / ("bfcl_validation40.parquet" if all200_mode else "bfcl_fixed4.parquet")
+    train_path = args.run_root / "inputs" / (
+        f"bfcl_train{len(train_ids)}_x{args.iterations}.parquet" if all200_mode else "bfcl_fixed4.parquet"
+    )
+    validation_path = args.run_root / "inputs" / (
+        f"bfcl_validation{len(validation_ids)}.parquet" if all200_mode else "bfcl_fixed4.parquet"
+    )
     _write_or_validate_dataset(train_path, train_rows)
     if validation_path != train_path:
         _write_or_validate_dataset(validation_path, validation_rows)
@@ -516,7 +578,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     seed_sha = _git_sha(repo_root)
     provenance = {
         "status": "preflight-only",
-        "mode": "june24_all200_train160_val40" if all200_mode else "june24_fixed40_smoke",
+        "mode": run_mode,
+        "split_profile": split_profile,
         "arm": args.arm,
         "seed_sha": seed_sha,
         "rlpaper_sha": args.rlpaper_sha,
@@ -552,9 +615,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "weight_decay": args.weight_decay,
         },
         "learning_rate": {
-            "style": "two_stage_linear" if all200_mode else "constant",
-            "warmup_updates": args.warmup_updates if all200_mode else 0,
-            "warmup_target_lr": args.warmup_target_lr if all200_mode else None,
+            "style": args.lr_schedule if all200_mode else "constant",
+            "warmup_updates": args.warmup_updates if all200_mode and args.lr_schedule == "two_stage_linear" else 0,
+            "warmup_target_lr": args.warmup_target_lr if all200_mode and args.lr_schedule == "two_stage_linear" else None,
             "final_lr": args.final_lr,
         },
         "checkpoints": [
@@ -567,7 +630,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if all200_mode
             else [total_updates]
         ),
-        "validation_steps": [0, 40, 80, 120, 160, 200] if all200_mode else [],
+        "validation_steps": (
+            [0, *[updates_per_iteration * index for index in range(1, args.iterations + 1)]]
+            if all200_mode
+            else []
+        ),
         "opd": {"only": True, "loss_coef": 1.0, "gate_beta": 5.0},
         "inline_same_prompt_diagnostics": args.inline_same_prompt_diagnostics,
         "external_analysis_calls": False,
@@ -578,6 +645,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "fresh_process_per_recovery_checkpoint" if all200_mode else "single_process"
         ),
         "rollout_gpu_memory_utilization": 0.41 if all200_mode else 0.45,
+        "execution_stop_after_update": args.stop_after_update,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
@@ -636,13 +704,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     f"files={len(archive_record['moved'])}",
                     flush=True,
                 )
+            execution_end_update = args.stop_after_update or total_updates
+            if (
+                execution_end_update <= 0
+                or execution_end_update > total_updates
+                or execution_end_update % args.checkpoint_updates
+            ):
+                raise ValueError("--stop-after-update must be a committed checkpoint within the run")
             run_checkpoint_segments(
                 command=command,
                 cwd=repo_root,
                 log_path=log_path,
                 checkpoint_root=checkpoint_root,
                 history_path=args.run_root / "metadata" / f"{args.arm}_segment_history.json",
-                total_updates=total_updates,
+                total_updates=execution_end_update,
                 updates_per_segment=args.checkpoint_updates,
                 seed_sha=seed_sha,
                 existing_checkpoint_seed_sha=provenance["seed_sha_history"][0],
@@ -658,7 +733,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             if result.returncode != 0:
                 raise RuntimeError(f"SEED training failed with exit code {result.returncode}; see {log_path}")
-        provenance["status"] = "training-finished"
+        completed_update = checkpoint_step(args.run_root / "checkpoints" / args.arm) if all200_mode else total_updates
+        provenance["status"] = "training-finished" if completed_update == total_updates else "drive-backed-smoke"
+        provenance["completed_update"] = completed_update
         provenance["training_log"] = str(log_path)
         _write_json(metadata_path, provenance)
         print(f"SEED_BFCL_TRAIN_DONE arm={args.arm} log={log_path}")

@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 
 from seed.june24_skill_summary import (
+    DEFAULT_SPLIT_PROFILE,
     DEFAULT_SPLIT_SEED,
+    SPLIT_PROFILES,
     build_all200_cohort_manifest,
     build_stratified_split_manifest,
     materialize_all200_training_skill_bank,
@@ -30,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
+        "--split-profile",
+        choices=tuple(SPLIT_PROFILES),
+        default=DEFAULT_SPLIT_PROFILE,
+    )
+    parser.add_argument(
         "--allow-repaired-task-id",
         action="append",
         default=[],
@@ -51,6 +58,7 @@ def main() -> None:
         seed=args.seed,
         iterations=args.iterations,
         batch_size=args.batch_size,
+        split_profile=args.split_profile,
     )
     _write_json(split_path, split)
     bank = materialize_all200_training_skill_bank(

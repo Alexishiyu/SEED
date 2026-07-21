@@ -47,20 +47,22 @@ def _checkpoint_evidence(
     checkpoint_root: Path,
     *,
     checkpoint_updates: int = 40,
+    checkpoint_steps: tuple[int, ...] = CHECKPOINT_STEPS,
 ) -> list[dict[str, Any]]:
     observed_steps = sorted(
         int(path.name.rsplit("_", 1)[-1])
         for path in checkpoint_root.glob("global_step_*")
         if path.is_dir()
     )
-    if checkpoint_updates <= 0 or 40 % checkpoint_updates:
+    updates_per_iteration = checkpoint_steps[0]
+    if checkpoint_updates <= 0 or updates_per_iteration % checkpoint_updates:
         raise RuntimeError(f"invalid recovery checkpoint interval: {checkpoint_updates}")
-    if not set(CHECKPOINT_STEPS).issubset(observed_steps):
-        raise RuntimeError(f"missing iteration checkpoints {CHECKPOINT_STEPS}; got {observed_steps}")
+    if not set(checkpoint_steps).issubset(observed_steps):
+        raise RuntimeError(f"missing iteration checkpoints {checkpoint_steps}; got {observed_steps}")
     invalid_steps = [
         step
         for step in observed_steps
-        if step <= 0 or step > CHECKPOINT_STEPS[-1] or step % checkpoint_updates
+        if step <= 0 or step > checkpoint_steps[-1] or step % checkpoint_updates
     ]
     if invalid_steps:
         raise RuntimeError(f"noncanonical recovery checkpoints: {invalid_steps}")
@@ -103,6 +105,7 @@ def _segment_evidence(
     *,
     seed_sha_history: list[str],
     checkpoint_updates: int = 40,
+    checkpoint_steps: tuple[int, ...] = CHECKPOINT_STEPS,
 ) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError(f"missing checkpoint-process segment history: {path}")
@@ -112,9 +115,10 @@ def _segment_evidence(
     segments = payload.get("segments")
     if not isinstance(segments, list) or not segments:
         raise RuntimeError("checkpoint-process segment history is empty")
-    if checkpoint_updates <= 0 or 40 % checkpoint_updates:
+    updates_per_iteration = checkpoint_steps[0]
+    if checkpoint_updates <= 0 or updates_per_iteration % checkpoint_updates:
         raise RuntimeError(f"invalid recovery checkpoint interval: {checkpoint_updates}")
-    allowed_steps = set(range(checkpoint_updates, CHECKPOINT_STEPS[-1] + 1, checkpoint_updates))
+    allowed_steps = set(range(checkpoint_updates, checkpoint_steps[-1] + 1, checkpoint_updates))
 
     covered = set()
     failed_attempt_count = 0
@@ -132,7 +136,7 @@ def _segment_evidence(
                     raise RuntimeError(f"failed segment left a noncanonical checkpoint: {item}")
                 continue
             delta = after - before
-            if expected != after or delta not in {checkpoint_updates, 40}:
+            if expected != after or delta not in {checkpoint_updates, updates_per_iteration}:
                 raise RuntimeError(
                     "checkpoint-process segment did not advance by the configured recovery "
                     f"interval or the legacy 40-step interval: {item}"
@@ -146,15 +150,15 @@ def _segment_evidence(
             raise RuntimeError(f"noncanonical checkpoint in segment history: {after}")
         covered.add(after)
 
-    if not set(CHECKPOINT_STEPS).issubset(covered):
+    if not set(checkpoint_steps).issubset(covered):
         raise RuntimeError(
-            f"segment history does not cover every checkpoint: expected={CHECKPOINT_STEPS}, got={sorted(covered)}"
+            f"segment history does not cover every checkpoint: expected={checkpoint_steps}, got={sorted(covered)}"
         )
     return {
         **payload,
         "validation": {
             "successful_checkpoint_coverage": sorted(covered),
-            "iteration_checkpoint_coverage": list(CHECKPOINT_STEPS),
+            "iteration_checkpoint_coverage": list(checkpoint_steps),
             "checkpoint_updates": checkpoint_updates,
             "failed_attempt_count": failed_attempt_count,
         },
@@ -166,16 +170,19 @@ def _update_evidence(
     *,
     schedules: list[dict[str, Any]],
     classification_by_id: dict[str, str],
+    total_updates: int = 200,
+    updates_per_iteration: int = 40,
+    learning_rate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     paths = sorted(root.glob("step_*.json"))
-    if len(paths) != 200:
-        raise RuntimeError(f"expected 200 optimizer diagnostic files, found {len(paths)}")
+    if len(paths) != total_updates:
+        raise RuntimeError(f"expected {total_updates} optimizer diagnostic files, found {len(paths)}")
     updates = [_json(path) for path in paths]
-    if [int(value.get("global_step", -1)) for value in updates] != list(range(1, 201)):
-        raise RuntimeError("optimizer diagnostics do not cover ordered steps 1 through 200")
+    if [int(value.get("global_step", -1)) for value in updates] != list(range(1, total_updates + 1)):
+        raise RuntimeError(f"optimizer diagnostics do not cover ordered steps 1 through {total_updates}")
     expected_batches = [batch for schedule in schedules for batch in schedule["batches"]]
-    if len(expected_batches) != 200:
-        raise RuntimeError("split manifest does not define exactly 200 four-task batches")
+    if len(expected_batches) != total_updates:
+        raise RuntimeError(f"split manifest does not define exactly {total_updates} batches")
     for index, value in enumerate(updates, start=1):
         if value.get("optimizer") != "Adam":
             raise RuntimeError(f"step {index} did not use strict Adam")
@@ -189,9 +196,9 @@ def _update_evidence(
             raise RuntimeError(f"step {index} has no active OPD tokens")
         if int(value.get("optimizer_steps_in_batch") or 0) != 1:
             raise RuntimeError(f"step {index} did not perform exactly one accumulated Adam update")
-        if int(value.get("iteration") or 0) != ((index - 1) // 40) + 1:
+        if int(value.get("iteration") or 0) != ((index - 1) // updates_per_iteration) + 1:
             raise RuntimeError(f"step {index} has an invalid iteration coordinate")
-        if int(value.get("batch_in_iteration") or 0) != ((index - 1) % 40) + 1:
+        if int(value.get("batch_in_iteration") or 0) != ((index - 1) % updates_per_iteration) + 1:
             raise RuntimeError(f"step {index} has an invalid within-iteration batch coordinate")
         if value.get("task_ids") != expected_batches[index - 1]:
             raise RuntimeError(f"step {index} task ids differ from the frozen schedule")
@@ -238,14 +245,29 @@ def _update_evidence(
             raise RuntimeError(f"step {index} has an RL gradient contribution")
         if index > 1 and updates[index - 2]["trainable_sha256_after"] != value["trainable_sha256_before"]:
             raise RuntimeError(f"step {index} did not start from the preceding updated actor")
-    expected_lr = {1: 0.0, 67: 1e-7, 200: 1e-6}
-    for step, expected in expected_lr.items():
-        observed = _require_finite(updates[step - 1].get("learning_rate_used"), f"step {step} LR")
-        if not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-12):
-            raise RuntimeError(f"step {step} LR mismatch: expected={expected}, observed={observed}")
     observed_lrs = [_require_finite(value.get("learning_rate_used"), "learning rate") for value in updates]
-    if any(left > right for left, right in zip(observed_lrs, observed_lrs[1:])):
-        raise RuntimeError("two-stage learning-rate schedule is not monotonic")
+    learning_rate = learning_rate or {
+        "style": "two_stage_linear",
+        "warmup_updates": 67,
+        "warmup_target_lr": 1e-7,
+        "final_lr": 1e-6,
+    }
+    if learning_rate.get("style") == "constant":
+        expected = float(learning_rate["final_lr"])
+        if any(not math.isclose(value, expected, rel_tol=1e-9, abs_tol=1e-12) for value in observed_lrs):
+            raise RuntimeError(f"constant learning-rate schedule differs from {expected}")
+    else:
+        expected_lr = {
+            1: 0.0,
+            int(learning_rate["warmup_updates"]): float(learning_rate["warmup_target_lr"]),
+            total_updates: float(learning_rate["final_lr"]),
+        }
+        for step, expected in expected_lr.items():
+            observed = observed_lrs[step - 1]
+            if not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-12):
+                raise RuntimeError(f"step {step} LR mismatch: expected={expected}, observed={observed}")
+        if any(left > right for left, right in zip(observed_lrs, observed_lrs[1:])):
+            raise RuntimeError("two-stage learning-rate schedule is not monotonic")
     return updates
 
 
@@ -254,23 +276,33 @@ def _validation_evidence(
     *,
     validation_ids: list[str],
     classification_by_id: dict[str, str],
+    validation_steps: tuple[int, ...] = VALIDATION_STEPS,
+    validation_counts: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
+    validation_counts = validation_counts or EXPECTED_VALIDATION_OUTCOME_COUNTS
+    validation_task_count = len(validation_ids)
     curve = []
-    for step in VALIDATION_STEPS:
+    for step in validation_steps:
         path = root / f"global_step_{step:06d}.json"
         if not path.is_file():
             raise RuntimeError(f"missing held-out validation evidence for step {step}: {path}")
         value = _json(path)
         records = value.get("records") or []
         task_ids = [str(record.get("task_id") or "") for record in records]
-        if len(records) != 40 or set(task_ids) != set(validation_ids) or len(set(task_ids)) != 40:
-            raise RuntimeError(f"step {step} validation does not exactly cover the held-out 40")
+        if (
+            len(records) != validation_task_count
+            or set(task_ids) != set(validation_ids)
+            or len(set(task_ids)) != validation_task_count
+        ):
+            raise RuntimeError(
+                f"step {step} validation does not exactly cover the held-out {validation_task_count}"
+            )
         if value.get("prompt_mode") != "ordinary_bfcl" or value.get("privileged_context") is not False:
             raise RuntimeError(f"step {step} validation used privileged context")
         by_class = {}
-        for classification in EXPECTED_VALIDATION_OUTCOME_COUNTS:
+        for classification in validation_counts:
             selected = [record for record in records if classification_by_id[record["task_id"]] == classification]
-            expected_count = EXPECTED_VALIDATION_OUTCOME_COUNTS[classification]
+            expected_count = validation_counts[classification]
             if len(selected) != expected_count:
                 raise RuntimeError(f"step {step} validation class {classification} count mismatch")
             success_count = sum(bool(record.get("success")) for record in selected)
@@ -283,9 +315,9 @@ def _validation_evidence(
         curve.append(
             {
                 "global_step": step,
-                "task_count": 40,
+                "task_count": validation_task_count,
                 "success_count": success_count,
-                "accuracy": success_count / 40,
+                "accuracy": success_count / validation_task_count,
                 "by_class": by_class,
                 "path": str(path),
                 "sha256": sha256_file(path),
@@ -294,7 +326,7 @@ def _validation_evidence(
     initial = curve[0]
     for point in curve:
         point["accuracy_change_from_initial"] = point["accuracy"] - initial["accuracy"]
-        for classification in EXPECTED_VALIDATION_OUTCOME_COUNTS:
+        for classification in validation_counts:
             point["by_class"][classification]["accuracy_change_from_initial"] = (
                 point["by_class"][classification]["accuracy"]
                 - initial["by_class"][classification]["accuracy"]
@@ -341,18 +373,13 @@ def main() -> None:
     run_root = args.run_root.expanduser().resolve()
     provenance_path = run_root / "metadata" / "privileged_june24_provenance.json"
     provenance = _json(provenance_path)
-    if provenance.get("mode") != "june24_all200_train160_val40":
+    if provenance.get("mode") not in {
+        "june24_all200_train160_val40",
+        "june24_all200_train128_val72_b64",
+    }:
         raise RuntimeError("provenance is not the June 24 all-200 five-pass run")
     if provenance.get("status") != "training-finished":
         raise RuntimeError("training has not finished")
-    if (
-        len(provenance.get("train_task_ids") or []) != 160
-        or len(provenance.get("validation_task_ids") or []) != 40
-        or int(provenance.get("training_rollouts") or 0) != 800
-        or int(provenance.get("validation_rollouts") or 0) != 240
-        or int(provenance.get("total_updates") or 0) != 200
-    ):
-        raise RuntimeError("provenance does not describe the frozen 160/40 five-pass schedule")
     if provenance.get("optimizer") != {
         "name": "adam",
         "betas": [0.9, 0.999],
@@ -376,12 +403,24 @@ def main() -> None:
     )
     if train_ids != provenance["train_task_ids"] or validation_ids != provenance["validation_task_ids"]:
         raise RuntimeError("runtime task ids differ from the frozen split")
+    schedule_value = split_value["training_schedule"]
+    total_updates = int(schedule_value["total_updates"])
+    updates_per_iteration = int(schedule_value["updates_per_iteration"])
+    checkpoint_steps = tuple(updates_per_iteration * index for index in range(1, 6))
+    validation_steps = (0, *checkpoint_steps)
+    if (
+        int(provenance.get("training_rollouts") or 0) != int(schedule_value["total_rollouts"])
+        or int(provenance.get("validation_rollouts") or 0) != 6 * len(validation_ids)
+        or int(provenance.get("total_updates") or 0) != total_updates
+        or list(provenance.get("validation_steps") or []) != list(validation_steps)
+    ):
+        raise RuntimeError("provenance does not match the frozen five-pass schedule")
     classification_by_id = {record["task_id"]: record["classification"] for record in cohort_records}
     train_counts = {
         name: sum(classification_by_id[task_id] == name for task_id in train_ids)
-        for name in EXPECTED_TRAIN_OUTCOME_COUNTS
+        for name in split_value["train"]["classification_counts"]
     }
-    if train_counts != EXPECTED_TRAIN_OUTCOME_COUNTS:
+    if train_counts != split_value["train"]["classification_counts"]:
         raise RuntimeError("training classification counts drifted")
 
     source_calls = provenance.get("source_calls") or []
@@ -410,16 +449,21 @@ def main() -> None:
         run_root / "evidence" / "privileged_june24" / "updates",
         schedules=schedules,
         classification_by_id=classification_by_id,
+        total_updates=total_updates,
+        updates_per_iteration=updates_per_iteration,
+        learning_rate=provenance.get("learning_rate"),
     )
     checkpoint_updates = int(provenance.get("checkpoint_updates") or 40)
     checkpoints = _checkpoint_evidence(
         run_root / "checkpoints" / "privileged_june24",
         checkpoint_updates=checkpoint_updates,
+        checkpoint_steps=checkpoint_steps,
     )
     segment_history = _segment_evidence(
         run_root / "metadata" / "privileged_june24_segment_history.json",
         seed_sha_history=[str(value) for value in provenance.get("seed_sha_history") or [provenance["seed_sha"]]],
         checkpoint_updates=checkpoint_updates,
+        checkpoint_steps=checkpoint_steps,
     )
     for checkpoint in checkpoints[:-1]:
         next_step = checkpoint["global_step"] + 1
@@ -429,6 +473,8 @@ def main() -> None:
         run_root / "evidence" / "privileged_june24" / "validation",
         validation_ids=validation_ids,
         classification_by_id=classification_by_id,
+        validation_steps=validation_steps,
+        validation_counts=split_value["validation"]["classification_counts"],
     )
     curve_path = run_root / "evidence" / "privileged_june24" / "validation_curve.json"
     curve_path.write_text(json.dumps(validation_curve, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -436,8 +482,8 @@ def main() -> None:
     export = _json(args.export_evidence.expanduser().resolve())
     if not export.get("checkpoint_resumable") or not (export.get("vllm_reload") or {}).get("ok"):
         raise RuntimeError("final merged export is not resumable and vLLM-reloadable")
-    if not str(export.get("checkpoint") or "").endswith("global_step_200"):
-        raise RuntimeError("final export did not use checkpoint 200")
+    if not str(export.get("checkpoint") or "").endswith(f"global_step_{total_updates}"):
+        raise RuntimeError(f"final export did not use checkpoint {total_updates}")
 
     report = {
         "status": "complete",
@@ -450,7 +496,11 @@ def main() -> None:
         "optimizer_updates": {
             "count": len(updates),
             "first": updates[0],
-            "warmup_boundary": updates[66],
+            "warmup_boundary": (
+                updates[int(provenance["learning_rate"]["warmup_updates"]) - 1]
+                if provenance["learning_rate"]["style"] == "two_stage_linear"
+                else None
+            ),
             "last": updates[-1],
         },
         "privileged_versus_control": _privileged_control_comparison(updates),

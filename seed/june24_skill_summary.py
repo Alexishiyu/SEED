@@ -21,6 +21,7 @@ SCHEMA_VERSION = "seed.june24_skill_summary.v1"
 ALL200_BANK_SCHEMA_VERSION = "seed.june24_skill_summary.all200.v2"
 ALL200_COHORT_SCHEMA_VERSION = "seed.june24_all200.v1"
 ALL200_SPLIT_SCHEMA_VERSION = "seed.june24_all200_split.v1"
+ALL200_SPLIT_128_SCHEMA_VERSION = "seed.june24_all200_split_128x72_b64.v1"
 FIXED_SELECTION = "teacher_success_student_failed/fixed"
 EXPECTED_FIXED_COUNT = 40
 EXPECTED_REJECTED_COUNT = 75
@@ -28,6 +29,8 @@ EXPECTED_ALL200_COUNT = 200
 DEFAULT_SPLIT_SEED = 20260624
 DEFAULT_TRAIN_ITERATIONS = 5
 DEFAULT_TRAIN_BATCH_SIZE = 4
+DEFAULT_SPLIT_PROFILE = "160x40_b4"
+LARGE_BATCH_SPLIT_PROFILE = "128x72_b64"
 OUTCOME_CLASSES = ("fixed", "both_wrong", "harmed", "both_correct")
 EXPECTED_OUTCOME_COUNTS = {
     "fixed": 40,
@@ -46,6 +49,34 @@ EXPECTED_VALIDATION_OUTCOME_COUNTS = {
     "both_wrong": 22,
     "harmed": 3,
     "both_correct": 7,
+}
+EXPECTED_TRAIN_128_OUTCOME_COUNTS = {
+    "fixed": 26,
+    "both_wrong": 72,
+    "harmed": 8,
+    "both_correct": 22,
+}
+EXPECTED_VALIDATION_72_OUTCOME_COUNTS = {
+    "fixed": 14,
+    "both_wrong": 40,
+    "harmed": 5,
+    "both_correct": 13,
+}
+SPLIT_PROFILES = {
+    DEFAULT_SPLIT_PROFILE: {
+        "schema_version": ALL200_SPLIT_SCHEMA_VERSION,
+        "selection": "june24_all200/stratified_160_40",
+        "batch_size": 4,
+        "train_counts": EXPECTED_TRAIN_OUTCOME_COUNTS,
+        "validation_counts": EXPECTED_VALIDATION_OUTCOME_COUNTS,
+    },
+    LARGE_BATCH_SPLIT_PROFILE: {
+        "schema_version": ALL200_SPLIT_128_SCHEMA_VERSION,
+        "selection": "june24_all200/stratified_128_72_b64",
+        "batch_size": 64,
+        "train_counts": EXPECTED_TRAIN_128_OUTCOME_COUNTS,
+        "validation_counts": EXPECTED_VALIDATION_72_OUTCOME_COUNTS,
+    },
 }
 REQUIRED_FIELDS = ("success_analysis", "mistake_analysis", "golden_workflow")
 SOURCE_FIELDS = ("source_call_path", "source_call_sha256")
@@ -368,13 +399,24 @@ def build_stratified_split_manifest(
     seed: int = DEFAULT_SPLIT_SEED,
     iterations: int = DEFAULT_TRAIN_ITERATIONS,
     batch_size: int = DEFAULT_TRAIN_BATCH_SIZE,
+    split_profile: str = DEFAULT_SPLIT_PROFILE,
 ) -> dict[str, Any]:
     cohort_value = _read_json(cohort_manifest)
     if not isinstance(cohort_value, Mapping):
         raise ValueError("all-200 cohort manifest must be a JSON object")
     records = validate_all200_cohort_manifest(cohort_value)
-    if seed != DEFAULT_SPLIT_SEED or iterations != DEFAULT_TRAIN_ITERATIONS or batch_size != DEFAULT_TRAIN_BATCH_SIZE:
-        raise ValueError("the canonical all-200 split requires seed=20260624, iterations=5, batch_size=4")
+    profile = SPLIT_PROFILES.get(split_profile)
+    if profile is None:
+        raise ValueError(f"unsupported all-200 split profile: {split_profile}")
+    if (
+        seed != DEFAULT_SPLIT_SEED
+        or iterations != DEFAULT_TRAIN_ITERATIONS
+        or batch_size != profile["batch_size"]
+    ):
+        raise ValueError(
+            f"split profile {split_profile} requires seed=20260624, "
+            f"iterations=5, batch_size={profile['batch_size']}"
+        )
 
     by_class = {
         name: [record["task_id"] for record in records if record["classification"] == name]
@@ -384,7 +426,7 @@ def build_stratified_split_manifest(
     validation_ids: list[str] = []
     for name in OUTCOME_CLASSES:
         ordered = sorted(by_class[name], key=lambda task_id: (_sha256_text(f"{seed}:{task_id}"), task_id))
-        validation_count = EXPECTED_VALIDATION_OUTCOME_COUNTS[name]
+        validation_count = profile["validation_counts"][name]
         validation_ids.extend(ordered[:validation_count])
         train_ids.extend(ordered[validation_count:])
     train_ids.sort(key=_bfcl_task_sort_key)
@@ -406,8 +448,9 @@ def build_stratified_split_manifest(
         )
 
     return {
-        "schema_version": ALL200_SPLIT_SCHEMA_VERSION,
-        "selection": "june24_all200/stratified_160_40",
+        "schema_version": profile["schema_version"],
+        "selection": profile["selection"],
+        **({"split_profile": split_profile} if split_profile != DEFAULT_SPLIT_PROFILE else {}),
         "seed": seed,
         "selection_key": "SHA256('20260624:<task_id>') within outcome class",
         "schedule_key": "SHA256('20260624:<iteration>:<task_id>')",
@@ -418,12 +461,12 @@ def build_stratified_split_manifest(
         "train": {
             "task_count": len(train_ids),
             "task_ids": train_ids,
-            "classification_counts": dict(EXPECTED_TRAIN_OUTCOME_COUNTS),
+            "classification_counts": dict(profile["train_counts"]),
         },
         "validation": {
             "task_count": len(validation_ids),
             "task_ids": validation_ids,
-            "classification_counts": dict(EXPECTED_VALIDATION_OUTCOME_COUNTS),
+            "classification_counts": dict(profile["validation_counts"]),
         },
         "training_schedule": {
             "iterations": iterations,
@@ -441,8 +484,12 @@ def validate_stratified_split_manifest(
     *,
     cohort_manifest: Path,
 ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-    if value.get("schema_version") != ALL200_SPLIT_SCHEMA_VERSION:
-        raise ValueError("split manifest is not the canonical June 24 all-200 160/40 split")
+    split_profile = str(value.get("split_profile") or DEFAULT_SPLIT_PROFILE)
+    profile = SPLIT_PROFILES.get(split_profile)
+    if profile is None or value.get("schema_version") != profile["schema_version"]:
+        raise ValueError("split manifest is not a supported canonical June 24 all-200 split")
+    if value.get("selection") != profile["selection"]:
+        raise ValueError("split manifest selection does not match its split profile")
     cohort_value = _read_json(cohort_manifest)
     if not isinstance(cohort_value, Mapping):
         raise ValueError("all-200 cohort manifest must be a JSON object")
@@ -450,14 +497,28 @@ def validate_stratified_split_manifest(
     cohort_ref = value.get("cohort_manifest")
     if not isinstance(cohort_ref, Mapping) or cohort_ref.get("sha256") != sha256_file(cohort_manifest):
         raise ValueError("split manifest cohort hash mismatch")
-    expected = build_stratified_split_manifest(cohort_manifest)
+    expected = build_stratified_split_manifest(
+        cohort_manifest,
+        seed=int(value.get("seed") or 0),
+        iterations=int(value.get("training_schedule", {}).get("iterations") or 0),
+        batch_size=int(value.get("training_schedule", {}).get("batch_size") or 0),
+        split_profile=split_profile,
+    )
     if value != expected:
-        raise ValueError("split manifest differs from the deterministic canonical 160/40 split")
+        raise ValueError("split manifest differs from its deterministic canonical profile")
     train_ids = list(value["train"]["task_ids"])
     validation_ids = list(value["validation"]["task_ids"])
     all_ids = {record["task_id"] for record in records}
-    if len(train_ids) != 160 or len(validation_ids) != 40 or set(train_ids) & set(validation_ids):
-        raise ValueError("split manifest does not contain disjoint 160/40 task sets")
+    expected_train = sum(profile["train_counts"].values())
+    expected_validation = sum(profile["validation_counts"].values())
+    if (
+        len(train_ids) != expected_train
+        or len(validation_ids) != expected_validation
+        or set(train_ids) & set(validation_ids)
+    ):
+        raise ValueError(
+            f"split manifest does not contain disjoint {expected_train}/{expected_validation} task sets"
+        )
     if set(train_ids) | set(validation_ids) != all_ids:
         raise ValueError("split manifest train/validation union does not cover all 200 tasks")
     schedules = list(value["training_schedule"]["iteration_schedules"])
@@ -640,7 +701,7 @@ def materialize_all200_training_skill_bank(
             )
     normalized_records.sort(key=lambda item: _bfcl_task_sort_key(item["task_id"]))
     if [record["task_id"] for record in normalized_records] != train_ids:
-        raise ValueError("training skill records do not exactly match the frozen 160-task split")
+        raise ValueError("training skill records do not exactly match the frozen training split")
     if {item["task_id"] for item in repaired_source_overrides} != allowed_repaired_set:
         raise ValueError("repaired-record overrides were not fully audited")
 
@@ -805,7 +866,7 @@ def load_skill_bank(
         if not task_id or task_id in records:
             raise ValueError(f"missing or duplicate task_id: {task_id!r}")
         if task_id not in set(allowed_ids):
-            scope = "corrected fixed-40 cohort" if fixed_mode else "frozen 160-task training split"
+            scope = "corrected fixed-40 cohort" if fixed_mode else "frozen all-200 training split"
             raise ValueError(f"{task_id}: outside {scope}")
         for field in REQUIRED_FIELDS:
             if not isinstance(raw.get(field), str) or not str(raw[field]).strip():

@@ -8,8 +8,11 @@ import pytest
 from seed.june24_skill_summary import (
     EXPECTED_OUTCOME_COUNTS,
     EXPECTED_TRAIN_OUTCOME_COUNTS,
+    EXPECTED_TRAIN_128_OUTCOME_COUNTS,
     EXPECTED_VALIDATION_OUTCOME_COUNTS,
+    EXPECTED_VALIDATION_72_OUTCOME_COUNTS,
     KNOWN_JUNE24_REPAIRED_TASK_IDS,
+    LARGE_BATCH_SPLIT_PROFILE,
     build_all200_cohort_manifest,
     build_stratified_split_manifest,
     load_skill_bank,
@@ -120,6 +123,45 @@ def test_builds_exact_stratified_160_40_and_five_schedules(tmp_path):
                 f"20260624:{schedule['iteration']}:{task_id}".encode()
             ).hexdigest(),
         )
+
+
+def test_builds_stratified_128_72_with_two_batches_per_iteration(tmp_path):
+    cohort_path, old_split_path, source_a, source_b = _all200_evidence(tmp_path)
+    old_split = json.loads(old_split_path.read_text(encoding="utf-8"))
+    split = build_stratified_split_manifest(
+        cohort_path,
+        batch_size=64,
+        split_profile=LARGE_BATCH_SPLIT_PROFILE,
+    )
+    train_ids, validation_ids, schedules = validate_stratified_split_manifest(
+        split,
+        cohort_manifest=cohort_path,
+    )
+
+    assert len(train_ids) == 128
+    assert len(validation_ids) == 72
+    assert set(old_split["validation"]["task_ids"]).issubset(validation_ids)
+    assert split["train"]["classification_counts"] == EXPECTED_TRAIN_128_OUTCOME_COUNTS
+    assert split["validation"]["classification_counts"] == EXPECTED_VALIDATION_72_OUTCOME_COUNTS
+    assert split["training_schedule"]["total_updates"] == 10
+    assert split["training_schedule"]["total_rollouts"] == 640
+    assert len(schedules) == 5
+    for schedule in schedules:
+        assert len(schedule["task_ids"]) == 128
+        assert set(schedule["task_ids"]) == set(train_ids)
+        assert [len(batch) for batch in schedule["batches"]] == [64, 64]
+
+    split_path = tmp_path / "split_128x72.json"
+    split_path.write_text(json.dumps(split, indent=2) + "\n", encoding="utf-8")
+    bank = materialize_all200_training_skill_bank(
+        source_dirs=[source_a, source_b],
+        cohort_manifest=cohort_path,
+        split_manifest=split_path,
+        output_path=tmp_path / "train128_bank.json",
+    )
+    assert bank["task_count"] == 128
+    assert bank["task_ids"] == train_ids
+    assert bank["source_task_count"] == 200
 
 
 def test_materializes_160_summaries_but_audits_all_200_sources(tmp_path):
