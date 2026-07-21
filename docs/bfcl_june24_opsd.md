@@ -213,7 +213,9 @@ stop flag to resume the same optimizer, scheduler, RNG, dataset position, and
 adapter through checkpoint 10. The paired controller is
 `examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb`.
 Its first cell fails closed unless the canonical Drive experiment root is
-writable. When the established `/content/drive2` DriveFS mount is healthy but
-`/content/drive` is not, it bind-mounts that healthy filesystem at the canonical
-path; otherwise a fresh mount has a 120-second timeout. A write/read/delete
-probe must pass before setup or run-root creation.
+writable. Mount Google Drive first with Colab's **Files > Mount Drive** control.
+When the established `/content/drive2` DriveFS mount is healthy but
+`/content/drive` is not, the cell bind-mounts that healthy filesystem at the
+canonical path. If neither path is healthy, it stops immediately instead of
+calling the kernel-blocking `drive.mount()` API. A write/read/delete probe must
+pass before setup or run-root creation.
