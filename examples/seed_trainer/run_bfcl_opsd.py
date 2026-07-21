@@ -34,6 +34,20 @@ from seed.june24_skill_summary import (
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
 
+def _bfcl_memory_profile(*, all200_mode: bool, batch_size: int) -> dict[str, object]:
+    """Keep the batch-64 A100 update below the 40 GB memory ceiling."""
+
+    batch64_mode = all200_mode and batch_size >= 64
+    return {
+        "rollout_gpu_memory_utilization": (
+            0.30 if batch64_mode else (0.41 if all200_mode else 0.45)
+        ),
+        "actor_param_offload": batch64_mode,
+        "actor_optimizer_offload": batch64_mode,
+        "cuda_allocator_config": "expandable_segments:True" if batch64_mode else None,
+    }
+
+
 def _git_sha(root: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -167,7 +181,10 @@ def _hydra_command(
     total_model_len = args.max_prompt_length + args.max_response_length
     all200_mode = args.cohort_manifest is not None
     checkpoint_updates = args.checkpoint_updates if all200_mode else updates_per_iteration
-    rollout_gpu_memory_utilization = 0.41 if all200_mode else 0.45
+    memory_profile = _bfcl_memory_profile(
+        all200_mode=all200_mode,
+        batch_size=args.batch_size,
+    )
     checkpoint_root = args.run_root / "checkpoints" / args.arm
     evidence_root = args.run_root / "evidence" / args.arm
     task_csv = ",".join(task_ids)
@@ -232,13 +249,16 @@ def _hydra_command(
         f"actor_rollout_ref.actor.lora_only_resume={str(all200_mode)}",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={total_model_len}",
         "actor_rollout_ref.actor.use_torch_compile=False",
-        "actor_rollout_ref.actor.fsdp_config.param_offload=False",
-        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
+        "actor_rollout_ref.actor.fsdp_config.param_offload="
+        f"{str(memory_profile['actor_param_offload'])}",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload="
+        f"{str(memory_profile['actor_optimizer_offload'])}",
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=sync",
         "actor_rollout_ref.rollout.n=1",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        f"actor_rollout_ref.rollout.gpu_memory_utilization={rollout_gpu_memory_utilization}",
+        "actor_rollout_ref.rollout.gpu_memory_utilization="
+        f"{memory_profile['rollout_gpu_memory_utilization']}",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False",
@@ -573,6 +593,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         total_updates=total_updates,
         updates_per_iteration=updates_per_iteration,
     )
+    memory_profile = _bfcl_memory_profile(
+        all200_mode=all200_mode,
+        batch_size=args.batch_size,
+    )
     bank_value = _read_json(args.june24_skill_bank)
     source_calls = bank_value.get("source_calls") or [
         {
@@ -652,7 +676,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_process_mode": (
             "fresh_process_per_recovery_checkpoint" if all200_mode else "single_process"
         ),
-        "rollout_gpu_memory_utilization": 0.41 if all200_mode else 0.45,
+        "memory_profile": memory_profile,
+        "rollout_gpu_memory_utilization": memory_profile["rollout_gpu_memory_utilization"],
         "execution_stop_after_update": args.stop_after_update,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
@@ -685,6 +710,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"skill_bank_sha256={bank.sha256}"
     )
     if args.execute:
+        allocator_config = memory_profile["cuda_allocator_config"]
+        if allocator_config is not None:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(allocator_config)
         gpu = _a100_guard()
         _write_json(args.run_root / "metadata" / "gpu.json", gpu)
         log_path = args.run_root / "logs" / f"{args.arm}_train.log"

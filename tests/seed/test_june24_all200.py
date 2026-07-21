@@ -1,3 +1,4 @@
+import ast
 import csv
 import hashlib
 import json
@@ -21,6 +22,40 @@ from seed.june24_skill_summary import (
     validate_all200_opd_update_task_count,
     validate_stratified_split_manifest,
 )
+
+
+def _load_launcher_function(function_name):
+    launcher = Path(__file__).resolve().parents[2] / "examples/seed_trainer/run_bfcl_opsd.py"
+    tree = ast.parse(launcher.read_text(encoding="utf-8"))
+    function_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[function_node], type_ignores=[]), launcher, "exec"), namespace)
+    return namespace[function_name]
+
+
+def test_bfcl_batch64_uses_the_a100_memory_safety_profile():
+    profile = _load_launcher_function("_bfcl_memory_profile")
+
+    assert profile(all200_mode=True, batch_size=64) == {
+        "rollout_gpu_memory_utilization": 0.30,
+        "actor_param_offload": True,
+        "actor_optimizer_offload": True,
+        "cuda_allocator_config": "expandable_segments:True",
+    }
+    assert profile(all200_mode=True, batch_size=4) == {
+        "rollout_gpu_memory_utilization": 0.41,
+        "actor_param_offload": False,
+        "actor_optimizer_offload": False,
+        "cuda_allocator_config": None,
+    }
+    assert (
+        profile(all200_mode=False, batch_size=4)["rollout_gpu_memory_utilization"]
+        == 0.45
+    )
 
 
 def test_validation_batch_size_exactly_partitions_72_without_changing_train_batch():
