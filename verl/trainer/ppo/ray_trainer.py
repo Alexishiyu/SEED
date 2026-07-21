@@ -81,6 +81,7 @@ from seed.june24_skill_summary import (
     guidance_block as build_june24_guidance_block,
     inject_guidance_into_system_prompt,
     load_skill_bank as load_june24_skill_bank,
+    validate_all200_opd_update_task_count,
 )
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
@@ -3751,10 +3752,11 @@ class RayPPOTrainer:
                                     raise RuntimeError("June 24 OPD actor batch has an unaudited outcome class")
                                 if set(task_ids) & set(bank.validation_task_ids):
                                     raise RuntimeError("held-out BFCL validation task leaked into OPD training")
-                                if bank.split_manifest_path is not None and len(set(task_ids)) != 4:
-                                    raise RuntimeError(
-                                        "canonical all-200 OPD update must contain exactly four task trajectories"
-                                    )
+                                validate_all200_opd_update_task_count(
+                                    task_ids,
+                                    configured_batch_size=int(self.config.data.train_batch_size),
+                                    split_manifest_path=bank.split_manifest_path,
+                                )
                                 class_to_id = {
                                     "fixed": 0,
                                     "both_wrong": 1,

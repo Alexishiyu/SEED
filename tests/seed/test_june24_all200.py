@@ -18,6 +18,7 @@ from seed.june24_skill_summary import (
     exact_divisor_batch_size,
     load_skill_bank,
     materialize_all200_training_skill_bank,
+    validate_all200_opd_update_task_count,
     validate_stratified_split_manifest,
 )
 
@@ -40,6 +41,32 @@ def test_validation_batch_size_rejects_nonpositive_inputs(
             requested_batch_size=requested_batch_size,
             task_count=validation_task_count,
         )
+
+
+@pytest.mark.parametrize("batch_size", [4, 64])
+def test_all200_opd_update_accepts_configured_task_trajectory_count(batch_size):
+    validate_all200_opd_update_task_count(
+        [f"multi_turn_base_{index}" for index in range(batch_size)],
+        configured_batch_size=batch_size,
+        split_manifest_path="split.json",
+    )
+
+
+def test_all200_opd_update_rejects_legacy_four_task_assumption_for_batch64():
+    with pytest.raises(RuntimeError, match="exactly 64 task trajectories, got 4"):
+        validate_all200_opd_update_task_count(
+            [f"multi_turn_base_{index}" for index in range(4)],
+            configured_batch_size=64,
+            split_manifest_path="split.json",
+        )
+
+
+def test_fixed40_path_does_not_apply_all200_batch_count_contract():
+    validate_all200_opd_update_task_count(
+        ["multi_turn_base_0"],
+        configured_batch_size=4,
+        split_manifest_path=None,
+    )
 
 
 def _classification(index: int) -> tuple[str, bool, bool]:

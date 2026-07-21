@@ -89,6 +89,26 @@ def exact_divisor_batch_size(*, requested_batch_size: int, task_count: int) -> i
     return math.gcd(requested_batch_size, task_count)
 
 
+def validate_all200_opd_update_task_count(
+    task_ids: Sequence[str],
+    *,
+    configured_batch_size: int,
+    split_manifest_path: str | Path | None,
+) -> None:
+    """Require one unique BFCL trajectory for every configured training task."""
+
+    if split_manifest_path is None:
+        return
+    if configured_batch_size <= 0:
+        raise ValueError("configured training batch size must be positive")
+    unique_task_count = len(set(task_ids))
+    if unique_task_count != configured_batch_size:
+        raise RuntimeError(
+            "canonical all-200 OPD update must contain exactly "
+            f"{configured_batch_size} task trajectories, got {unique_task_count}"
+        )
+
+
 REQUIRED_FIELDS = ("success_analysis", "mistake_analysis", "golden_workflow")
 SOURCE_FIELDS = ("source_call_path", "source_call_sha256")
 ALLOWED_RECORD_FIELDS = {"task_id", *REQUIRED_FIELDS, *SOURCE_FIELDS}
