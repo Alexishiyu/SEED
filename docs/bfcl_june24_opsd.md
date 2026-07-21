@@ -185,10 +185,11 @@ boundary; this avoids the unsupported `64 + 8` BFCL reset shape. During each
 checkpoint-bounded process it prints a narrow 30-second heartbeat, including
 the newest trainer progress record when one is available, while retaining the
 complete output in the Drive-backed log. The one-A100 batch-64 memory profile
-reserves 35% of GPU memory for vLLM (enough to create KV-cache blocks) and
-offloads actor parameters, optimizer state, and saved activations to CPU during
-training. This replaces the failed 30% profile, which left vLLM no cache blocks,
-while retaining more update headroom than the earlier 41% profile.
+reserves 41% of GPU memory for vLLM and offloads actor parameters, optimizer
+state, and saved activations to CPU during training. The 18,432-token context
+requires 2.53 GiB of KV cache: the measured 30% and 35% profiles could not start
+vLLM, while 41% is the established startup-safe reservation. The three CPU
+offloads provide the update headroom missing from the earlier 41% profile.
 
 Build and preflight it with:
 

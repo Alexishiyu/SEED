@@ -41,7 +41,7 @@ def test_bfcl_batch64_uses_the_a100_memory_safety_profile():
     profile = _load_launcher_function("_bfcl_memory_profile")
 
     assert profile(all200_mode=True, batch_size=64) == {
-        "rollout_gpu_memory_utilization": 0.35,
+        "rollout_gpu_memory_utilization": 0.41,
         "actor_activation_offload": True,
         "actor_param_offload": True,
         "actor_optimizer_offload": True,
