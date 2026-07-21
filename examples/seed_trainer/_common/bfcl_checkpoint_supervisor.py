@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -15,6 +16,61 @@ _CHECKPOINT_DIR_RE = re.compile(r"global_step_(\d+)$")
 _UPDATE_FILE_RE = re.compile(r"step_(\d+)\.json$")
 _ROLLOUT_FILE_RE = re.compile(r"(\d+)\.jsonl$")
 _VALIDATION_FILE_RE = re.compile(r"global_step_(\d+)\.json$")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _last_training_progress(log_path: Path, *, read_bytes: int = 262_144) -> str | None:
+    """Return the newest tqdm training-progress line from a live segment log."""
+
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - read_bytes))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    matches = re.findall(r"Training Progress:[^\r\n]*", text)
+    return matches[-1].strip() if matches else None
+
+
+def _run_with_progress(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    log: Any,
+    log_path: Path,
+    checkpoint_before: int,
+    expected_checkpoint: int,
+    heartbeat_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    started = time.monotonic()
+    while True:
+        try:
+            returncode = process.wait(timeout=heartbeat_seconds)
+            return subprocess.CompletedProcess(list(command), returncode)
+        except subprocess.TimeoutExpired:
+            elapsed = int(time.monotonic() - started)
+            progress = _last_training_progress(log_path)
+            detail = (
+                f" trainer_progress={progress!r}"
+                if progress
+                else " phase=initialization_or_validation"
+            )
+            print(
+                "SEED_BFCL_SEGMENT_PROGRESS "
+                f"checkpoint_before={checkpoint_before} expected_checkpoint={expected_checkpoint} "
+                f"elapsed_seconds={elapsed}{detail}",
+                flush=True,
+            )
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -159,15 +215,17 @@ def run_checkpoint_segments(
     seed_sha: str,
     existing_checkpoint_seed_sha: str | None = None,
     run_process: Callable[..., Any] | None = None,
+    heartbeat_seconds: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Run one checkpoint-bounded trainer process at a time until completion."""
 
     if total_updates <= 0 or updates_per_segment <= 0:
         raise ValueError("training update counts must be positive")
+    if heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be positive")
     if total_updates % updates_per_segment:
         raise ValueError("total_updates must be divisible by updates_per_segment")
 
-    run_process = run_process or subprocess.run
     allowed_steps = set(range(0, total_updates + 1, updates_per_segment))
     current = checkpoint_step(checkpoint_root)
     if current not in allowed_steps:
@@ -208,13 +266,24 @@ def run_checkpoint_segments(
                 f"checkpoint_before={current} expected_checkpoint={expected} seed_sha={seed_sha}\n"
             )
             log.flush()
-            result = run_process(
-                list(command),
-                cwd=cwd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            if run_process is None:
+                result = _run_with_progress(
+                    command,
+                    cwd=cwd,
+                    log=log,
+                    log_path=log_path,
+                    checkpoint_before=current,
+                    expected_checkpoint=expected,
+                    heartbeat_seconds=heartbeat_seconds,
+                )
+            else:
+                result = run_process(
+                    list(command),
+                    cwd=cwd,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
 
         after = checkpoint_step(checkpoint_root)
         record = {

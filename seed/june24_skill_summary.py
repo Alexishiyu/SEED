@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -78,6 +79,16 @@ SPLIT_PROFILES = {
         "validation_counts": EXPECTED_VALIDATION_72_OUTCOME_COUNTS,
     },
 }
+
+
+def exact_divisor_batch_size(*, requested_batch_size: int, task_count: int) -> int:
+    """Choose an exact divisor so fixed-width environments never see a remainder batch."""
+
+    if requested_batch_size <= 0 or task_count <= 0:
+        raise ValueError("batch-size inputs must be positive")
+    return math.gcd(requested_batch_size, task_count)
+
+
 REQUIRED_FIELDS = ("success_analysis", "mistake_analysis", "golden_workflow")
 SOURCE_FIELDS = ("source_call_path", "source_call_sha256")
 ALLOWED_RECORD_FIELDS = {"task_id", *REQUIRED_FIELDS, *SOURCE_FIELDS}

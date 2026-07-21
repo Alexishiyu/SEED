@@ -15,10 +15,31 @@ from seed.june24_skill_summary import (
     LARGE_BATCH_SPLIT_PROFILE,
     build_all200_cohort_manifest,
     build_stratified_split_manifest,
+    exact_divisor_batch_size,
     load_skill_bank,
     materialize_all200_training_skill_bank,
     validate_stratified_split_manifest,
 )
+
+
+def test_validation_batch_size_exactly_partitions_72_without_changing_train_batch():
+    assert exact_divisor_batch_size(requested_batch_size=64, task_count=72) == 8
+    assert exact_divisor_batch_size(requested_batch_size=4, task_count=40) == 4
+
+
+@pytest.mark.parametrize(
+    ("requested_batch_size", "validation_task_count"),
+    [(0, 72), (64, 0), (-1, 72), (64, -1)],
+)
+def test_validation_batch_size_rejects_nonpositive_inputs(
+    requested_batch_size,
+    validation_task_count,
+):
+    with pytest.raises(ValueError, match="must be positive"):
+        exact_divisor_batch_size(
+            requested_batch_size=requested_batch_size,
+            task_count=validation_task_count,
+        )
 
 
 def _classification(index: int) -> tuple[str, bool, bool]:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from examples.seed_trainer._common.bfcl_checkpoint_supervisor import (
+    _last_training_progress,
     archive_uncheckpointed_evidence,
     checkpoint_step,
     run_checkpoint_segments,
@@ -13,6 +14,23 @@ from examples.seed_trainer.collect_bfcl_opsd_five_pass_evidence import (
     _checkpoint_evidence,
     _segment_evidence,
 )
+
+
+def test_live_progress_reader_extracts_latest_tqdm_record(tmp_path: Path):
+    log = tmp_path / "train.log"
+    log.write_bytes(
+        b"setup\n\x1b[36m(TaskRunner pid=1)\x1b[0m \rTraining Progress:   1%| 1/10\r"
+        b"Training Progress:  20%| 2/10 [01:23<05:00]\n"
+    )
+
+    assert _last_training_progress(log) == "Training Progress:  20%| 2/10 [01:23<05:00]"
+
+
+def test_live_progress_reader_returns_none_before_training(tmp_path: Path):
+    log = tmp_path / "train.log"
+    log.write_text("initializing validation\n", encoding="utf-8")
+
+    assert _last_training_progress(log) is None
 
 
 def _write_checkpoint(root: Path, step: int, *, include_full_model: bool = True) -> None:

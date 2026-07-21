@@ -255,8 +255,10 @@ The separate five-pass all-200 experiment uses the frozen stratified 160/40
 split controller
 [`examples/seed_trainer/bfcl_seed_opsd_160x40_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_160x40_a100.ipynb);
 it does not relax or relabel the fixed-40 smoke contract.
-The 128-train/72-validation large-batch variant uses two batches of 64 per
-epoch, checkpoints every batch, and is controlled by
+The 128-train/72-validation large-batch variant uses two training batches of
+64 per epoch, checkpoints every batch, and evaluates the held-out set in nine
+exact batches of eight to avoid a short BFCL environment reset batch. It is
+controlled by
 [`examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb).
 
 Other teacher-self SFT entrypoints use the same naming convention:

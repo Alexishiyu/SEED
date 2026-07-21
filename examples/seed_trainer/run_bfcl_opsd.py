@@ -21,6 +21,7 @@ from agent_system.environments.env_package.bfcl.envs import (
     load_bfcl_components,
 )
 from seed.june24_skill_summary import (
+    exact_divisor_batch_size,
     load_skill_bank,
     sha256_file,
     validate_all200_cohort_manifest,
@@ -159,6 +160,7 @@ def _hydra_command(
     task_ids: list[str],
     train_path: Path,
     validation_path: Path,
+    validation_batch_size: int,
     total_updates: int,
     updates_per_iteration: int,
 ) -> list[str]:
@@ -193,7 +195,7 @@ def _hydra_command(
         f"data.train_files={train_path}",
         f"data.val_files={validation_path}",
         f"data.train_batch_size={args.batch_size}",
-        f"data.val_batch_size={args.batch_size}",
+        f"data.val_batch_size={validation_batch_size}",
         f"data.max_prompt_length={args.max_prompt_length}",
         f"data.max_response_length={args.max_response_length}",
         "data.filter_overlong_prompts=False",
@@ -558,11 +560,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_or_validate_dataset(train_path, train_rows)
     if validation_path != train_path:
         _write_or_validate_dataset(validation_path, validation_rows)
+    validation_batch_size = exact_divisor_batch_size(
+        requested_batch_size=args.batch_size,
+        task_count=len(validation_ids),
+    )
     command = _hydra_command(
         args,
         task_ids=train_ids,
         train_path=train_path,
         validation_path=validation_path,
+        validation_batch_size=validation_batch_size,
         total_updates=total_updates,
         updates_per_iteration=updates_per_iteration,
     )
@@ -591,6 +598,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "scheduled_train_task_ids": scheduled_train_ids,
         "iterations": args.iterations if all200_mode else 1,
         "batch_size": args.batch_size,
+        "validation_batch_size": validation_batch_size,
         "updates_per_iteration": updates_per_iteration,
         "total_updates": total_updates,
         "training_rollouts": len(train_rows),

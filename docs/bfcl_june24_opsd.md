@@ -179,7 +179,12 @@ checkpoint, for 640 training rollouts and 10 updates/checkpoints total. This
 profile uses SEED's usual constant `1e-6` learning-rate behavior with no
 warmup; all OPD-only, prompt, model, LoRA, source-audit, and inline-control
 contracts remain unchanged. Validation covers all 72 held-out tasks at steps
-`0, 2, 4, 6, 8, 10` (432 validation rollouts).
+`0, 2, 4, 6, 8, 10` (432 validation rollouts). The launcher keeps the
+optimizer batch at 64 but uses nine exact validation batches of eight at each
+boundary; this avoids the unsupported `64 + 8` BFCL reset shape. During each
+checkpoint-bounded process it prints a narrow 30-second heartbeat, including
+the newest trainer progress record when one is available, while retaining the
+complete output in the Drive-backed log.
 
 Build and preflight it with:
 
