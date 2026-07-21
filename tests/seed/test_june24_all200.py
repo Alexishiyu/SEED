@@ -44,13 +44,11 @@ def test_bfcl_batch64_uses_the_a100_memory_safety_profile():
         "rollout_gpu_memory_utilization": 0.30,
         "actor_param_offload": True,
         "actor_optimizer_offload": True,
-        "cuda_allocator_config": "expandable_segments:True",
     }
     assert profile(all200_mode=True, batch_size=4) == {
         "rollout_gpu_memory_utilization": 0.41,
         "actor_param_offload": False,
         "actor_optimizer_offload": False,
-        "cuda_allocator_config": None,
     }
     assert (
         profile(all200_mode=False, batch_size=4)["rollout_gpu_memory_utilization"]

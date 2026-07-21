@@ -44,7 +44,6 @@ def _bfcl_memory_profile(*, all200_mode: bool, batch_size: int) -> dict[str, obj
         ),
         "actor_param_offload": batch64_mode,
         "actor_optimizer_offload": batch64_mode,
-        "cuda_allocator_config": "expandable_segments:True" if batch64_mode else None,
     }
 
 
@@ -710,9 +709,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"skill_bank_sha256={bank.sha256}"
     )
     if args.execute:
-        allocator_config = memory_profile["cuda_allocator_config"]
-        if allocator_config is not None:
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(allocator_config)
         gpu = _a100_guard()
         _write_json(args.run_root / "metadata" / "gpu.json", gpu)
         log_path = args.run_root / "logs" / f"{args.arm}_train.log"
