@@ -68,6 +68,7 @@ SPLIT_PROFILES = {
         "schema_version": ALL200_SPLIT_SCHEMA_VERSION,
         "selection": "june24_all200/stratified_160_40",
         "batch_size": 4,
+        "allowed_iterations": (DEFAULT_TRAIN_ITERATIONS,),
         "train_counts": EXPECTED_TRAIN_OUTCOME_COUNTS,
         "validation_counts": EXPECTED_VALIDATION_OUTCOME_COUNTS,
     },
@@ -75,6 +76,10 @@ SPLIT_PROFILES = {
         "schema_version": ALL200_SPLIT_128_SCHEMA_VERSION,
         "selection": "june24_all200/stratified_128_72_b64",
         "batch_size": 64,
+        # Ten iterations are reserved for the explicit checkpoint-10 -> 20
+        # continuation.  The launcher separately requires an intact
+        # checkpoint-10 parent contract before it will execute that schedule.
+        "allowed_iterations": (DEFAULT_TRAIN_ITERATIONS, 10),
         "train_counts": EXPECTED_TRAIN_128_OUTCOME_COUNTS,
         "validation_counts": EXPECTED_VALIDATION_72_OUTCOME_COUNTS,
     },
@@ -439,14 +444,15 @@ def build_stratified_split_manifest(
     profile = SPLIT_PROFILES.get(split_profile)
     if profile is None:
         raise ValueError(f"unsupported all-200 split profile: {split_profile}")
+    allowed_iterations = tuple(profile.get("allowed_iterations") or (DEFAULT_TRAIN_ITERATIONS,))
     if (
         seed != DEFAULT_SPLIT_SEED
-        or iterations != DEFAULT_TRAIN_ITERATIONS
+        or iterations not in allowed_iterations
         or batch_size != profile["batch_size"]
     ):
         raise ValueError(
             f"split profile {split_profile} requires seed=20260624, "
-            f"iterations=5, batch_size={profile['batch_size']}"
+            f"iterations in {allowed_iterations}, batch_size={profile['batch_size']}"
         )
 
     by_class = {

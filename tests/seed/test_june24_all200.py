@@ -247,6 +247,46 @@ def test_builds_stratified_128_72_with_two_batches_per_iteration(tmp_path):
     assert bank["source_task_count"] == 200
 
 
+def test_batch64_checkpoint20_extension_preserves_first_five_schedules(tmp_path):
+    cohort_path, _, _, _ = _all200_evidence(tmp_path)
+    original = build_stratified_split_manifest(
+        cohort_path,
+        batch_size=64,
+        split_profile=LARGE_BATCH_SPLIT_PROFILE,
+    )
+    extension = build_stratified_split_manifest(
+        cohort_path,
+        iterations=10,
+        batch_size=64,
+        split_profile=LARGE_BATCH_SPLIT_PROFILE,
+    )
+    train_ids, validation_ids, schedules = validate_stratified_split_manifest(
+        extension,
+        cohort_manifest=cohort_path,
+    )
+
+    assert extension["train"] == original["train"]
+    assert extension["validation"] == original["validation"]
+    assert extension["training_schedule"]["iteration_schedules"][:5] == original[
+        "training_schedule"
+    ]["iteration_schedules"]
+    assert extension["training_schedule"]["total_updates"] == 20
+    assert extension["training_schedule"]["total_rollouts"] == 1280
+    assert len(schedules) == 10
+    assert len(train_ids) == 128
+    assert len(validation_ids) == 72
+    for expected_iteration, schedule in enumerate(schedules, start=1):
+        assert schedule["iteration"] == expected_iteration
+        assert set(schedule["task_ids"]) == set(train_ids)
+        assert [len(batch) for batch in schedule["batches"]] == [64, 64]
+
+
+def test_160x40_profile_rejects_ten_iterations(tmp_path):
+    cohort_path, _, _, _ = _all200_evidence(tmp_path)
+    with pytest.raises(ValueError, match="iterations in"):
+        build_stratified_split_manifest(cohort_path, iterations=10, batch_size=4)
+
+
 def test_materializes_160_summaries_but_audits_all_200_sources(tmp_path):
     cohort_path, split_path, source_a, source_b = _all200_evidence(tmp_path)
     bank_path = tmp_path / "train_bank.json"

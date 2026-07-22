@@ -35,6 +35,79 @@ def _last_training_progress(log_path: Path, *, read_bytes: int = 262_144) -> str
     return matches[-1].strip() if matches else None
 
 
+def _runtime_telemetry_sample(
+    *,
+    phase: str,
+    log_path: Path,
+    checkpoint_before: int,
+    expected_checkpoint: int,
+    elapsed_seconds: int,
+    trainer_progress: str | None,
+    returncode: int | None = None,
+) -> dict[str, Any]:
+    """Collect compact, best-effort resource telemetry without touching training state."""
+
+    sample: dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "checkpoint_before": checkpoint_before,
+        "expected_checkpoint": expected_checkpoint,
+        "elapsed_seconds": elapsed_seconds,
+        "trainer_progress": trainer_progress,
+        "returncode": returncode,
+    }
+    try:
+        disk = shutil.disk_usage(log_path.parent)
+        sample["drive_disk_total_bytes"] = int(disk.total)
+        sample["drive_disk_used_bytes"] = int(disk.used)
+        sample["drive_disk_free_bytes"] = int(disk.free)
+    except OSError as exc:
+        sample["drive_disk_error"] = str(exc)
+    try:
+        meminfo = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, raw = line.split(":", 1)
+            meminfo[key] = int(raw.strip().split()[0]) * 1024
+        sample["host_memory_total_bytes"] = meminfo.get("MemTotal")
+        sample["host_memory_available_bytes"] = meminfo.get("MemAvailable")
+    except (OSError, ValueError, IndexError) as exc:
+        sample["host_memory_error"] = str(exc)
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        values = [value.strip() for value in result.stdout.strip().split(",")]
+        if len(values) == 5:
+            sample.update(
+                {
+                    "gpu_memory_used_mib": float(values[0]),
+                    "gpu_memory_free_mib": float(values[1]),
+                    "gpu_utilization_percent": float(values[2]),
+                    "gpu_temperature_c": float(values[3]),
+                    "gpu_power_w": float(values[4]),
+                }
+            )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        sample["gpu_telemetry_error"] = str(exc)
+    return sample
+
+
+def _append_runtime_telemetry(path: Path | None, sample: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sample, ensure_ascii=True, sort_keys=True) + "\n")
+
+
 def _run_with_progress(
     command: Sequence[str],
     *,
@@ -44,6 +117,7 @@ def _run_with_progress(
     checkpoint_before: int,
     expected_checkpoint: int,
     heartbeat_seconds: float,
+    telemetry_path: Path | None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         list(command),
@@ -53,9 +127,34 @@ def _run_with_progress(
         text=True,
     )
     started = time.monotonic()
+    _append_runtime_telemetry(
+        telemetry_path,
+        _runtime_telemetry_sample(
+            phase="segment_start",
+            log_path=log_path,
+            checkpoint_before=checkpoint_before,
+            expected_checkpoint=expected_checkpoint,
+            elapsed_seconds=0,
+            trainer_progress=None,
+        ),
+    )
     while True:
         try:
             returncode = process.wait(timeout=heartbeat_seconds)
+            elapsed = int(time.monotonic() - started)
+            progress = _last_training_progress(log_path)
+            _append_runtime_telemetry(
+                telemetry_path,
+                _runtime_telemetry_sample(
+                    phase="segment_finish",
+                    log_path=log_path,
+                    checkpoint_before=checkpoint_before,
+                    expected_checkpoint=expected_checkpoint,
+                    elapsed_seconds=elapsed,
+                    trainer_progress=progress,
+                    returncode=returncode,
+                ),
+            )
             return subprocess.CompletedProcess(list(command), returncode)
         except subprocess.TimeoutExpired:
             elapsed = int(time.monotonic() - started)
@@ -70,6 +169,17 @@ def _run_with_progress(
                 f"checkpoint_before={checkpoint_before} expected_checkpoint={expected_checkpoint} "
                 f"elapsed_seconds={elapsed}{detail}",
                 flush=True,
+            )
+            _append_runtime_telemetry(
+                telemetry_path,
+                _runtime_telemetry_sample(
+                    phase="heartbeat",
+                    log_path=log_path,
+                    checkpoint_before=checkpoint_before,
+                    expected_checkpoint=expected_checkpoint,
+                    elapsed_seconds=elapsed,
+                    trainer_progress=progress,
+                ),
             )
 
 
@@ -216,6 +326,8 @@ def run_checkpoint_segments(
     existing_checkpoint_seed_sha: str | None = None,
     run_process: Callable[..., Any] | None = None,
     heartbeat_seconds: float = 30.0,
+    telemetry_path: Path | None = None,
+    post_segment_command: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run one checkpoint-bounded trainer process at a time until completion."""
 
@@ -260,6 +372,7 @@ def run_checkpoint_segments(
     while current < total_updates:
         expected = current + updates_per_segment
         started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
         with log_path.open("a", encoding="utf-8") as log:
             log.write(
                 "\nSEED_BFCL_SEGMENT_START "
@@ -275,6 +388,7 @@ def run_checkpoint_segments(
                     checkpoint_before=current,
                     expected_checkpoint=expected,
                     heartbeat_seconds=heartbeat_seconds,
+                    telemetry_path=telemetry_path,
                 )
             else:
                 result = run_process(
@@ -286,15 +400,30 @@ def run_checkpoint_segments(
                 )
 
         after = checkpoint_step(checkpoint_root)
+        finished_at = datetime.now(timezone.utc).isoformat()
         record = {
             "kind": "training_segment",
             "timestamp_utc": started_at,
+            "finished_timestamp_utc": finished_at,
+            "duration_seconds": round(time.monotonic() - started_monotonic, 3),
             "checkpoint_before": current,
             "expected_checkpoint": expected,
             "checkpoint_after": after,
             "returncode": int(result.returncode),
             "seed_sha": seed_sha,
         }
+        postprocess_returncode = None
+        if result.returncode == 0 and after == expected and post_segment_command is not None:
+            with log_path.open("a", encoding="utf-8") as log:
+                postprocess = subprocess.run(
+                    list(post_segment_command),
+                    cwd=cwd,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            postprocess_returncode = int(postprocess.returncode)
+            record["postprocess_returncode"] = postprocess_returncode
         segments.append(record)
         _write_json(history_path, payload)
         if result.returncode != 0:
@@ -306,6 +435,11 @@ def run_checkpoint_segments(
             raise RuntimeError(
                 f"SEED training segment exited without its exact checkpoint: "
                 f"before={current}, expected={expected}, after={after}"
+            )
+        if postprocess_returncode not in (None, 0):
+            raise RuntimeError(
+                f"SEED diagnostics failed after checkpoint {after} with exit code "
+                f"{postprocess_returncode}; checkpoint is preserved; see {log_path}"
             )
         print(
             f"SEED_BFCL_SEGMENT_DONE checkpoint_before={current} "

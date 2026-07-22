@@ -826,6 +826,7 @@ class DataParallelPPOActor(BasePPOActor):
                 outcome_classes_for_evidence.append(outcome_class)
         trainable_sha_before = self._trainable_parameter_sha256() if opd_only else None
         response_token_sha256 = self._tensor_sha256(data.batch["responses"]) if opd_only else None
+        task_token_metrics_for_evidence = []
         if opd_only:
             response_length_for_evidence = data.batch["responses"].size(-1)
             if multi_turn:
@@ -839,6 +840,44 @@ class DataParallelPPOActor(BasePPOActor):
                 if teacher_step_mask_for_evidence is not None
                 else 0
             )
+            if teacher_step_mask_for_evidence is not None:
+                active_mask_for_task_evidence = (
+                    generated_mask_for_evidence
+                    & teacher_step_mask_for_evidence.bool().unsqueeze(-1)
+                )
+                response_tokens_per_row = (
+                    generated_mask_for_evidence.sum(dim=-1).detach().cpu().tolist()
+                )
+                active_tokens_per_row = (
+                    active_mask_for_task_evidence.sum(dim=-1).detach().cpu().tolist()
+                )
+                teacher_steps_per_row = (
+                    teacher_step_mask_for_evidence.bool().detach().cpu().tolist()
+                )
+                compact_by_task = {}
+                for row_index, (task_id, outcome_class) in enumerate(
+                    zip(
+                        data.non_tensor_batch.get("task_id", []),
+                        data.non_tensor_batch.get("june24_outcome_class", []),
+                    )
+                ):
+                    task_id = str(task_id)
+                    entry = compact_by_task.setdefault(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "outcome_class": str(outcome_class),
+                            "actor_row_count": 0,
+                            "teacher_step_count": 0,
+                            "response_token_count": 0,
+                            "active_token_count": 0,
+                        },
+                    )
+                    entry["actor_row_count"] += 1
+                    entry["teacher_step_count"] += int(bool(teacher_steps_per_row[row_index]))
+                    entry["response_token_count"] += int(response_tokens_per_row[row_index])
+                    entry["active_token_count"] += int(active_tokens_per_row[row_index])
+                task_token_metrics_for_evidence = list(compact_by_task.values())
             active_tokens_by_class_for_evidence = {}
             outcome_class_ids_for_evidence = data.batch.get("june24_outcome_class_id")
             if outcome_class_ids_for_evidence is not None and teacher_step_mask_for_evidence is not None:
@@ -1228,6 +1267,12 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 diagnostics_root = self.config.get("opd_diagnostics_path")
                 if diagnostics_root:
+                    updates_per_iteration = int(
+                        self.config.get("opd_updates_per_iteration") or 40
+                    )
+                    if updates_per_iteration <= 0:
+                        raise RuntimeError("OPD evidence updates-per-iteration must be positive")
+
                     def _metric_mean(key: str) -> float:
                         values = metrics.get(key, [])
                         if not isinstance(values, (list, tuple)):
@@ -1236,8 +1281,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     diagnostics = {
                         "global_step": self.global_step,
-                        "iteration": ((self.global_step - 1) // 40) + 1,
-                        "batch_in_iteration": ((self.global_step - 1) % 40) + 1,
+                        "iteration": ((self.global_step - 1) // updates_per_iteration) + 1,
+                        "batch_in_iteration": ((self.global_step - 1) % updates_per_iteration) + 1,
+                        "updates_per_iteration": updates_per_iteration,
                         "task_ids": task_ids_for_evidence,
                         "outcome_classes": outcome_classes_for_evidence,
                         "outcome_class_counts": {
@@ -1251,6 +1297,7 @@ class DataParallelPPOActor(BasePPOActor):
                         "control_teacher_student_token_alignment": has_control_teacher_signal,
                         "active_token_count": active_token_count_for_evidence,
                         "active_tokens_by_outcome_class": active_tokens_by_class_for_evidence,
+                        "task_token_metrics": task_token_metrics_for_evidence,
                         "learning_rate_used": float(self.actor_optimizer.param_groups[0]["lr"]),
                         "optimizer": type(self.actor_optimizer).__name__,
                         "optimizer_steps_in_batch": 1,

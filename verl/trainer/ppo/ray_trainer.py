@@ -3840,6 +3840,37 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+                step_metrics_dir = self.config.trainer.get("step_metrics_dir")
+                if step_metrics_dir:
+                    scalar_metrics = {}
+                    nonfinite_metrics = {}
+                    for metric_name, metric_value in metrics.items():
+                        sanitized = _sanitize_json_value(metric_value)
+                        if isinstance(sanitized, (bool, int, float, np.number)):
+                            numeric = float(sanitized)
+                            if np.isfinite(numeric):
+                                scalar_metrics[str(metric_name)] = numeric
+                            else:
+                                nonfinite_metrics[str(metric_name)] = repr(numeric)
+                    step_metrics_path = (
+                        Path(str(step_metrics_dir)).expanduser()
+                        / f"step_{self.global_steps:06d}.json"
+                    )
+                    step_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                    step_metrics_path.write_text(
+                        _safe_json_dumps(
+                            {
+                                "global_step": int(self.global_steps),
+                                "scalar_metrics": scalar_metrics,
+                                "nonfinite_metrics": nonfinite_metrics,
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+
                 # TODO: make a canonical logger that supports various backend
                 self._dump_and_remove_seed_state_group_metrics(metrics)
                 logger.log(data=metrics, step=self.global_steps)

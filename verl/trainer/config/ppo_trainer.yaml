@@ -59,6 +59,7 @@ actor_rollout_ref:
     opd_only: False # optimize only the unchanged OPD objective; excludes PG, entropy, KL, reward, critic, and auxiliary losses
     opd_evidence_path: null # optional rank-0 JSON path for before/after trainable-parameter SHA-256
     opd_diagnostics_path: null # optional rank-0 directory containing one exact-token diagnostic JSON per optimizer update
+    opd_updates_per_iteration: null # optional deterministic BFCL schedule width used only for evidence coordinates
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -339,6 +340,7 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  step_metrics_dir: null # compact scalar/timing metrics per optimizer update, no dump if null
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

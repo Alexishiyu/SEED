@@ -1,4 +1,4 @@
-"""Validate the June 24 all-200 five-pass run and write one completion report."""
+"""Validate a June 24 all-200 run, including the checkpoint-10 -> 20 extension."""
 
 from __future__ import annotations
 
@@ -173,6 +173,7 @@ def _update_evidence(
     total_updates: int = 200,
     updates_per_iteration: int = 40,
     learning_rate: dict[str, Any] | None = None,
+    legacy_coordinate_through: int = 0,
 ) -> list[dict[str, Any]]:
     paths = sorted(root.glob("step_*.json"))
     if len(paths) != total_updates:
@@ -196,10 +197,14 @@ def _update_evidence(
             raise RuntimeError(f"step {index} has no active OPD tokens")
         if int(value.get("optimizer_steps_in_batch") or 0) != 1:
             raise RuntimeError(f"step {index} did not perform exactly one accumulated Adam update")
-        if int(value.get("iteration") or 0) != ((index - 1) // updates_per_iteration) + 1:
-            raise RuntimeError(f"step {index} has an invalid iteration coordinate")
-        if int(value.get("batch_in_iteration") or 0) != ((index - 1) % updates_per_iteration) + 1:
-            raise RuntimeError(f"step {index} has an invalid within-iteration batch coordinate")
+        expected_iteration = ((index - 1) // updates_per_iteration) + 1
+        expected_batch = ((index - 1) % updates_per_iteration) + 1
+        observed_iteration = int(value.get("iteration") or 0)
+        observed_batch = int(value.get("batch_in_iteration") or 0)
+        if (observed_iteration, observed_batch) != (expected_iteration, expected_batch):
+            legacy_coordinate = (((index - 1) // 40) + 1, ((index - 1) % 40) + 1)
+            if index > legacy_coordinate_through or (observed_iteration, observed_batch) != legacy_coordinate:
+                raise RuntimeError(f"step {index} has invalid schedule coordinates")
         if value.get("task_ids") != expected_batches[index - 1]:
             raise RuntimeError(f"step {index} task ids differ from the frozen schedule")
         expected_classes = [classification_by_id[task_id] for task_id in expected_batches[index - 1]]
@@ -225,6 +230,19 @@ def _update_evidence(
         for hash_key in ("response_token_sha256", "generated_token_mask_sha256"):
             if len(str(value.get(hash_key) or "")) != 64:
                 raise RuntimeError(f"step {index} has invalid {hash_key}")
+        task_token_metrics = value.get("task_token_metrics") or []
+        if index > legacy_coordinate_through:
+            task_metric_ids = [str(item.get("task_id") or "") for item in task_token_metrics]
+            if (
+                len(task_token_metrics) != len(expected_batches[index - 1])
+                or task_metric_ids != expected_batches[index - 1]
+                or len(set(task_metric_ids)) != len(task_metric_ids)
+            ):
+                raise RuntimeError(f"step {index} compact task-token diagnostics are incomplete")
+            if sum(int(item.get("active_token_count") or 0) for item in task_token_metrics) != int(
+                value["active_token_count"]
+            ):
+                raise RuntimeError(f"step {index} task active-token totals do not reconcile")
         metrics = value.get("metrics") or {}
         for key in (
             "actor/opd_loss",
@@ -406,11 +424,28 @@ def main() -> None:
     schedule_value = split_value["training_schedule"]
     total_updates = int(schedule_value["total_updates"])
     updates_per_iteration = int(schedule_value["updates_per_iteration"])
-    checkpoint_steps = tuple(updates_per_iteration * index for index in range(1, 6))
+    iterations = int(schedule_value["iterations"])
+    if iterations == 10:
+        extension_parent = provenance.get("extension_parent") or {}
+        parent_snapshot_path = (
+            run_root / "metadata" / "privileged_june24_checkpoint10_parent.json"
+        )
+        if (
+            extension_parent.get("extension_from_update") != 10
+            or extension_parent.get("target_update") != 20
+            or not parent_snapshot_path.is_file()
+            or _json(parent_snapshot_path) != extension_parent
+        ):
+            raise RuntimeError("checkpoint-20 run lacks exact immutable checkpoint-10 lineage")
+    elif iterations != 5:
+        raise RuntimeError(f"unsupported June 24 iteration count: {iterations}")
+    checkpoint_steps = tuple(
+        updates_per_iteration * index for index in range(1, iterations + 1)
+    )
     validation_steps = (0, *checkpoint_steps)
     if (
         int(provenance.get("training_rollouts") or 0) != int(schedule_value["total_rollouts"])
-        or int(provenance.get("validation_rollouts") or 0) != 6 * len(validation_ids)
+        or int(provenance.get("validation_rollouts") or 0) != (iterations + 1) * len(validation_ids)
         or int(provenance.get("total_updates") or 0) != total_updates
         or list(provenance.get("validation_steps") or []) != list(validation_steps)
     ):
@@ -452,6 +487,9 @@ def main() -> None:
         total_updates=total_updates,
         updates_per_iteration=updates_per_iteration,
         learning_rate=provenance.get("learning_rate"),
+        legacy_coordinate_through=(
+            int((provenance.get("extension_parent") or {}).get("extension_from_update") or 0)
+        ),
     )
     checkpoint_updates = int(provenance.get("checkpoint_updates") or 40)
     checkpoints = _checkpoint_evidence(
@@ -478,6 +516,21 @@ def main() -> None:
     )
     curve_path = run_root / "evidence" / "privileged_june24" / "validation_curve.json"
     curve_path.write_text(json.dumps(validation_curve, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    diagnostics_path = (
+        run_root
+        / "evidence"
+        / "privileged_june24"
+        / "diagnostics"
+        / "diagnostic_summary.json"
+    )
+    diagnostics = _json(diagnostics_path)
+    if (
+        diagnostics.get("status") != "healthy"
+        or int(diagnostics.get("latest_checkpoint") or 0) != total_updates
+        or int(diagnostics.get("update_evidence_count") or 0) != total_updates
+    ):
+        raise RuntimeError("final compact diagnostic bundle is missing or unhealthy")
 
     export = _json(args.export_evidence.expanduser().resolve())
     if not export.get("checkpoint_resumable") or not (export.get("vllm_reload") or {}).get("ok"):
@@ -510,6 +563,8 @@ def main() -> None:
             "after": validation_curve[-1],
         },
         "validation_curve_path": str(curve_path),
+        "diagnostics": diagnostics,
+        "diagnostics_path": str(diagnostics_path),
         "checkpoint_and_export": export,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

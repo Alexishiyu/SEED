@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,6 +196,39 @@ def test_segment_supervisor_accepts_ten_update_recovery_boundaries(tmp_path: Pat
         110,
         120,
     ]
+
+
+def test_segment_supervisor_extends_checkpoint10_through_checkpoint20(tmp_path: Path):
+    checkpoint_root = tmp_path / "checkpoints"
+    _write_checkpoint(checkpoint_root, 10, include_full_model=False)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        before = checkpoint_step(checkpoint_root)
+        calls.append(before)
+        _write_checkpoint(checkpoint_root, before + 1, include_full_model=False)
+        return SimpleNamespace(returncode=0)
+
+    history = run_checkpoint_segments(
+        command=["python", "trainer.py"],
+        cwd=tmp_path,
+        log_path=tmp_path / "train.log",
+        checkpoint_root=checkpoint_root,
+        history_path=tmp_path / "segment_history.json",
+        total_updates=20,
+        updates_per_segment=1,
+        seed_sha="extension",
+        existing_checkpoint_seed_sha="checkpoint10",
+        run_process=fake_run,
+        post_segment_command=[sys.executable, "-c", "pass"],
+    )
+
+    assert calls == list(range(10, 20))
+    assert checkpoint_step(checkpoint_root) == 20
+    completed = [item for item in history if item["kind"] == "training_segment"]
+    assert [item["checkpoint_after"] for item in completed] == list(range(11, 21))
+    assert all(item["postprocess_returncode"] == 0 for item in completed)
+    assert all(item["duration_seconds"] >= 0 for item in completed)
 
 
 def test_segment_evidence_accepts_recovered_initial_checkpoint(tmp_path: Path):

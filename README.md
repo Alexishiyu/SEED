@@ -260,6 +260,12 @@ The 128-train/72-validation large-batch variant uses two training batches of
 exact batches of eight to avoid a short BFCL environment reset batch. It is
 controlled by
 [`examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb`](examples/seed_trainer/bfcl_seed_opsd_128x72_b64_a100.ipynb).
+Its explicit checkpoint-10 to checkpoint-20 continuation adds five deterministic
+epochs while preserving the original schedule prefix, optimizer/RNG state, and
+constant learning rate. The continuation also writes compact per-update timing,
+resource telemetry, validation-transition tables, health checks, and PNG plots;
+it refuses to start unless checkpoint 10 and its ordinary-prompt validation are
+complete and the immutable parent contract matches exactly.
 
 Other teacher-self SFT entrypoints use the same naming convention:
 

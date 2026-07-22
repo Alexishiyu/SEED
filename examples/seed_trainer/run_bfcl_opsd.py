@@ -77,6 +77,16 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
+def _write_json_immutable(path: Path, value: Any) -> None:
+    """Create an immutable contract snapshot or verify the existing copy."""
+
+    if path.is_file():
+        if _read_json(path) != value:
+            raise RuntimeError(f"immutable contract snapshot drifted: {path}")
+        return
+    _write_json(path, value)
+
+
 def _a100_guard() -> dict[str, Any]:
     import torch
 
@@ -166,6 +176,131 @@ def _classification_map(cohort_value: Mapping[str, Any]) -> dict[str, str]:
     return {record["task_id"]: record["classification"] for record in records}
 
 
+def _validate_extension_parent(
+    *,
+    args: argparse.Namespace,
+    split_profile: str,
+    train_ids: list[str],
+    validation_ids: list[str],
+    schedules: list[dict[str, Any]],
+    total_updates: int,
+) -> dict[str, Any] | None:
+    """Require an exact completed checkpoint-10 parent before extending to 20."""
+
+    if args.extend_from_update is None:
+        if split_profile == "128x72_b64" and args.iterations != 5:
+            raise ValueError(
+                "the 10-iteration batch-64 schedule requires --extend-from-update=10"
+            )
+        return None
+    if (
+        split_profile != "128x72_b64"
+        or args.extend_from_update != 10
+        or args.iterations != 10
+        or total_updates != 20
+    ):
+        raise ValueError(
+            "the canonical extension requires split profile 128x72_b64, "
+            "--extend-from-update=10, --iterations=10, and total_updates=20"
+        )
+
+    metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
+    plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
+    if not metadata_path.is_file() or not plan_path.is_file():
+        raise RuntimeError("checkpoint-10 extension requires the original plan and provenance")
+    previous = _read_json(metadata_path)
+    previous_plan = _read_json(plan_path)
+    required_parent = {
+        "mode": "june24_all200_train128_val72_b64",
+        "split_profile": "128x72_b64",
+        "iterations": 5,
+        "batch_size": 64,
+        "updates_per_iteration": 2,
+        "total_updates": 10,
+        "completed_update": 10,
+        "status": "training-finished",
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": previous.get(key)}
+        for key, expected in required_parent.items()
+        if previous.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"checkpoint-10 parent contract mismatch: {mismatches}")
+    if previous.get("train_task_ids") != train_ids or previous.get("validation_task_ids") != validation_ids:
+        raise RuntimeError("extension train/validation identities differ from checkpoint 10")
+    if previous.get("optimizer") != {
+        "name": "adam",
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+    }:
+        raise RuntimeError("extension parent is not strict Adam with zero weight decay")
+    if previous.get("learning_rate") != {
+        "style": "constant",
+        "warmup_updates": 0,
+        "warmup_target_lr": None,
+        "final_lr": 1e-6,
+    }:
+        raise RuntimeError("extension parent does not use the frozen constant 1e-6 schedule")
+    if previous.get("opd") != {"only": True, "loss_coef": 1.0, "gate_beta": 5.0}:
+        raise RuntimeError("extension parent OPD contract drifted")
+
+    parent_split_path = Path(str(previous["split_manifest_path"]))
+    parent_cohort_path = Path(str(previous["cohort_manifest_path"]))
+    if not parent_split_path.is_file() or not parent_cohort_path.is_file():
+        raise RuntimeError("extension parent input manifests are missing")
+    _, _, parent_schedules = validate_stratified_split_manifest(
+        _read_json(parent_split_path),
+        cohort_manifest=parent_cohort_path,
+    )
+    if schedules[:5] != parent_schedules:
+        raise RuntimeError("extension schedules 1-5 do not exactly reproduce the parent run")
+    if checkpoint_step(args.run_root / "checkpoints" / args.arm) != 10:
+        raise RuntimeError("extension requires latest complete checkpoint 10")
+    required_evidence = [
+        args.run_root / "evidence" / args.arm / "updates" / "step_000010.json",
+        args.run_root / "evidence" / args.arm / "validation" / "global_step_000010.json",
+    ]
+    missing = [str(path) for path in required_evidence if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"checkpoint-10 extension evidence is incomplete: {missing}")
+
+    provenance_snapshot_path = (
+        args.run_root / "metadata" / f"{args.arm}_provenance_at_checkpoint10.json"
+    )
+    plan_snapshot_path = (
+        args.run_root / "metadata" / f"{args.arm}_plan_at_checkpoint10.json"
+    )
+    _write_json_immutable(provenance_snapshot_path, dict(previous))
+    _write_json_immutable(plan_snapshot_path, dict(previous_plan))
+
+    snapshot = {
+        "schema_version": "seed.bfcl.checkpoint10_parent.v1",
+        "extension_from_update": 10,
+        "target_update": 20,
+        "parent_seed_sha": previous.get("seed_sha"),
+        "parent_seed_sha_history": previous.get("seed_sha_history") or [previous.get("seed_sha")],
+        "parent_provenance_path": str(provenance_snapshot_path),
+        "parent_provenance_sha256": sha256_file(provenance_snapshot_path),
+        "parent_plan_path": str(plan_snapshot_path),
+        "parent_plan_sha256": sha256_file(plan_snapshot_path),
+        "parent_split_manifest_path": str(parent_split_path),
+        "parent_split_manifest_sha256": sha256_file(parent_split_path),
+        "parent_train_dataset_path": previous.get("train_dataset_path"),
+        "parent_train_dataset_sha256": previous.get("train_dataset_sha256"),
+        "checkpoint_path": str(args.run_root / "checkpoints" / args.arm / "global_step_10"),
+        "update_evidence_sha256": sha256_file(required_evidence[0]),
+        "validation_evidence_sha256": sha256_file(required_evidence[1]),
+        "first_five_schedules_identical": True,
+    }
+    _write_json_immutable(
+        args.run_root / "metadata" / f"{args.arm}_checkpoint10_parent.json",
+        snapshot,
+    )
+    return snapshot
+
+
 def _hydra_command(
     args: argparse.Namespace,
     *,
@@ -246,6 +381,7 @@ def _hydra_command(
         "actor_rollout_ref.actor.opd_gate_beta=5.0",
         f"actor_rollout_ref.actor.opd_evidence_path={evidence_root / 'trainable_checksum.json'}",
         f"actor_rollout_ref.actor.opd_diagnostics_path={evidence_root / 'updates'}",
+        f"actor_rollout_ref.actor.opd_updates_per_iteration={updates_per_iteration}",
         f"actor_rollout_ref.actor.lora_only_resume={str(all200_mode)}",
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={total_model_len}",
         "actor_rollout_ref.actor.use_torch_compile=False",
@@ -289,6 +425,7 @@ def _hydra_command(
         f"trainer.default_local_dir={checkpoint_root}",
         f"trainer.rollout_data_dir={evidence_root / 'rollouts'}",
         f"trainer.validation_data_dir={evidence_root / 'validation'}",
+        f"trainer.step_metrics_dir={evidence_root / 'trainer_metrics'}",
     ]
     if args.fixed_manifest:
         command.extend(
@@ -299,6 +436,8 @@ def _hydra_command(
             ]
         )
     else:
+        if args.extend_from_update is not None:
+            raise ValueError("--extend-from-update is valid only for the all-200 batch-64 continuation")
         command.extend(
             [
                 f"algorithm.seed.june24_cohort_manifest={args.cohort_manifest}",
@@ -341,6 +480,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--updates", type=int, default=1, help="Legacy fixed-40 smoke updates")
     parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument(
+        "--extend-from-update",
+        type=int,
+        default=None,
+        help="Fail-closed batch-64 continuation; canonical value is 10 with --iterations=10",
+    )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--optimizer", choices=("adam", "adamw"), default=None)
@@ -411,16 +556,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "128x72_b64": {
                 "batch_size": 64,
                 "updates_per_iteration": 2,
-                "total_updates": 10,
+                "allowed_iterations": (5, 10),
                 "lr_schedule": "constant",
             },
         }
         profile_contract = profile_contracts.get(split_profile)
         if profile_contract is None:
             raise ValueError(f"unsupported all-200 split profile: {split_profile}")
-        if args.iterations != 5 or args.batch_size != profile_contract["batch_size"]:
+        allowed_iterations = tuple(profile_contract.get("allowed_iterations") or (5,))
+        if args.iterations not in allowed_iterations or args.batch_size != profile_contract["batch_size"]:
             raise ValueError(
-                f"split profile {split_profile} requires --iterations=5 and "
+                f"split profile {split_profile} requires --iterations in {allowed_iterations} and "
                 f"--batch-size={profile_contract['batch_size']}"
             )
         if args.checkpoint_updates <= 0 or profile_contract["updates_per_iteration"] % args.checkpoint_updates:
@@ -456,10 +602,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         schedule_value = split_value["training_schedule"]
         total_updates = int(schedule_value["total_updates"])
         updates_per_iteration = int(schedule_value["updates_per_iteration"])
-        if (
-            total_updates != profile_contract["total_updates"]
-            or updates_per_iteration != profile_contract["updates_per_iteration"]
-        ):
+        expected_total_updates = args.iterations * profile_contract["updates_per_iteration"]
+        if total_updates != expected_total_updates or updates_per_iteration != profile_contract["updates_per_iteration"]:
             raise ValueError(f"training schedule does not match split profile {split_profile}")
         bank = load_skill_bank(
             args.june24_skill_bank,
@@ -559,6 +703,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "fixed_manifest_path": str(args.fixed_manifest),
             "fixed_manifest_sha256": bank.fixed_manifest_sha256,
         }
+
+    extension_parent = (
+        _validate_extension_parent(
+            args=args,
+            split_profile=split_profile,
+            train_ids=train_ids,
+            validation_ids=validation_ids,
+            schedules=schedules,
+            total_updates=total_updates,
+        )
+        if all200_mode
+        else None
+    )
 
     from transformers import AutoTokenizer
 
@@ -679,6 +836,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "memory_profile": memory_profile,
         "rollout_gpu_memory_utilization": memory_profile["rollout_gpu_memory_utilization"],
         "execution_stop_after_update": args.stop_after_update,
+        "extension_parent": extension_parent,
     }
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
@@ -704,6 +862,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _write_json(preserved_plan, previous_plan)
     _write_json(metadata_path, provenance)
     _write_json(plan_path, {"command": command, "provenance": provenance})
+    diagnostics_command = [
+        sys.executable,
+        str(repo_root / "examples" / "seed_trainer" / "build_bfcl_opsd_diagnostics.py"),
+        "--run-root",
+        str(args.run_root),
+        "--arm",
+        args.arm,
+        "--fail-on-anomaly",
+    ]
+    if extension_parent is not None:
+        subprocess.run(
+            [*diagnostics_command, "--require-latest-checkpoint", str(args.extend_from_update)],
+            cwd=repo_root,
+            check=True,
+        )
     print(
         f"SEED_BFCL_PREFLIGHT_OK mode={provenance['mode']} arm={args.arm} "
         f"train={len(train_ids)} validation={len(validation_ids)} updates={total_updates} "
@@ -754,6 +927,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 updates_per_segment=args.checkpoint_updates,
                 seed_sha=seed_sha,
                 existing_checkpoint_seed_sha=provenance["seed_sha_history"][0],
+                heartbeat_seconds=60.0,
+                telemetry_path=args.run_root / "evidence" / args.arm / "runtime_telemetry.jsonl",
+                post_segment_command=diagnostics_command,
             )
         else:
             with log_path.open("a", encoding="utf-8") as log:
