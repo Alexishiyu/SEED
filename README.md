@@ -265,7 +265,9 @@ epochs while preserving the original schedule prefix, optimizer/RNG state, and
 constant learning rate. The continuation also writes compact per-update timing,
 resource telemetry, validation-transition tables, health checks, and PNG plots;
 it refuses to start unless checkpoint 10 and its ordinary-prompt validation are
-complete and the immutable parent contract matches exactly.
+complete and the immutable parent contract matches exactly. The controller's
+`SEED_COMMIT` is a full immutable runtime SHA rather than a floating branch tip;
+change it only to another tested and pushed revision.
 
 Other teacher-self SFT entrypoints use the same naming convention:
 
