@@ -206,10 +206,26 @@ def _validate_extension_parent(
 
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
-    if not metadata_path.is_file() or not plan_path.is_file():
+    provenance_snapshot_path = (
+        args.run_root / "metadata" / f"{args.arm}_provenance_at_checkpoint10.json"
+    )
+    plan_snapshot_path = (
+        args.run_root / "metadata" / f"{args.arm}_plan_at_checkpoint10.json"
+    )
+    snapshot_presence = (
+        provenance_snapshot_path.is_file(),
+        plan_snapshot_path.is_file(),
+    )
+    if any(snapshot_presence) and not all(snapshot_presence):
+        raise RuntimeError("checkpoint-10 extension snapshots are incomplete")
+    if all(snapshot_presence):
+        previous = _read_json(provenance_snapshot_path)
+        previous_plan = _read_json(plan_snapshot_path)
+    elif metadata_path.is_file() and plan_path.is_file():
+        previous = _read_json(metadata_path)
+        previous_plan = _read_json(plan_path)
+    else:
         raise RuntimeError("checkpoint-10 extension requires the original plan and provenance")
-    previous = _read_json(metadata_path)
-    previous_plan = _read_json(plan_path)
     required_parent = {
         "mode": "june24_all200_train128_val72_b64",
         "split_profile": "128x72_b64",
@@ -256,8 +272,12 @@ def _validate_extension_parent(
     )
     if schedules[:5] != parent_schedules:
         raise RuntimeError("extension schedules 1-5 do not exactly reproduce the parent run")
-    if checkpoint_step(args.run_root / "checkpoints" / args.arm) != 10:
-        raise RuntimeError("extension requires latest complete checkpoint 10")
+    latest_checkpoint = checkpoint_step(args.run_root / "checkpoints" / args.arm)
+    if latest_checkpoint < args.extend_from_update or latest_checkpoint > total_updates:
+        raise RuntimeError(
+            "extension requires a resumable checkpoint between 10 and 20; "
+            f"observed {latest_checkpoint}"
+        )
     required_evidence = [
         args.run_root / "evidence" / args.arm / "updates" / "step_000010.json",
         args.run_root / "evidence" / args.arm / "validation" / "global_step_000010.json",
@@ -266,12 +286,6 @@ def _validate_extension_parent(
     if missing:
         raise RuntimeError(f"checkpoint-10 extension evidence is incomplete: {missing}")
 
-    provenance_snapshot_path = (
-        args.run_root / "metadata" / f"{args.arm}_provenance_at_checkpoint10.json"
-    )
-    plan_snapshot_path = (
-        args.run_root / "metadata" / f"{args.arm}_plan_at_checkpoint10.json"
-    )
     _write_json_immutable(provenance_snapshot_path, dict(previous))
     _write_json_immutable(plan_snapshot_path, dict(previous_plan))
 
@@ -872,8 +886,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "--fail-on-anomaly",
     ]
     if extension_parent is not None:
+        resumable_checkpoint = checkpoint_step(
+            args.run_root / "checkpoints" / args.arm
+        )
         subprocess.run(
-            [*diagnostics_command, "--require-latest-checkpoint", str(args.extend_from_update)],
+            [
+                *diagnostics_command,
+                "--require-latest-checkpoint",
+                str(resumable_checkpoint),
+            ],
             cwd=repo_root,
             check=True,
         )
