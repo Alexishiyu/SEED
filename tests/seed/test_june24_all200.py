@@ -1,8 +1,11 @@
 import ast
+import argparse
 import csv
 import hashlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +59,71 @@ def test_bfcl_batch64_uses_the_a100_memory_safety_profile():
         profile(all200_mode=False, batch_size=4)["rollout_gpu_memory_utilization"]
         == 0.45
     )
+
+
+def test_checkpoint20_extension_is_accepted_only_for_all200_mode(tmp_path):
+    launcher = Path(__file__).resolve().parents[2] / "examples/seed_trainer/run_bfcl_opsd.py"
+    tree = ast.parse(launcher.read_text(encoding="utf-8"))
+    function_names = {"_bfcl_memory_profile", "_hydra_command"}
+    function_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in function_names
+    ]
+    namespace = {"argparse": argparse, "Path": Path, "sys": sys}
+    exec(compile(ast.Module(body=function_nodes, type_ignores=[]), launcher, "exec"), namespace)
+    hydra_command = namespace["_hydra_command"]
+
+    args = SimpleNamespace(
+        max_prompt_length=1024,
+        max_response_length=256,
+        cohort_manifest=tmp_path / "cohort.json",
+        checkpoint_updates=1,
+        batch_size=64,
+        run_root=tmp_path / "run",
+        arm="privileged_june24",
+        june24_skill_bank=tmp_path / "bank.json",
+        same_prompt_control=False,
+        inline_same_prompt_diagnostics=True,
+        model="Qwen/Qwen3-4B-Instruct-2507",
+        lora_rank=16,
+        lora_alpha=32,
+        optimizer="adam",
+        final_lr=1e-6,
+        weight_decay=0.0,
+        bfcl_root=tmp_path / "bfcl",
+        resume="auto",
+        fixed_manifest=None,
+        split_manifest=tmp_path / "split.json",
+        lr_schedule="constant",
+        warmup_updates=0,
+        warmup_target_lr=None,
+        extend_from_update=10,
+    )
+    command = hydra_command(
+        args,
+        task_ids=["multi_turn_base_0"],
+        train_path=tmp_path / "train.parquet",
+        validation_path=tmp_path / "validation.parquet",
+        validation_batch_size=8,
+        total_updates=20,
+        updates_per_iteration=2,
+    )
+    assert f"algorithm.seed.june24_cohort_manifest={args.cohort_manifest}" in command
+    assert "trainer.total_training_steps=20" in command
+
+    args.fixed_manifest = tmp_path / "fixed.json"
+    args.cohort_manifest = None
+    with pytest.raises(ValueError, match="all-200 batch-64 continuation"):
+        hydra_command(
+            args,
+            task_ids=["multi_turn_base_0"],
+            train_path=tmp_path / "train.parquet",
+            validation_path=tmp_path / "train.parquet",
+            validation_batch_size=1,
+            total_updates=1,
+            updates_per_iteration=1,
+        )
 
 
 def test_validation_batch_size_exactly_partitions_72_without_changing_train_batch():

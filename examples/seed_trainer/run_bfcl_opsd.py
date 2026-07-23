@@ -428,6 +428,8 @@ def _hydra_command(
         f"trainer.step_metrics_dir={evidence_root / 'trainer_metrics'}",
     ]
     if args.fixed_manifest:
+        if args.extend_from_update is not None:
+            raise ValueError("--extend-from-update is valid only for the all-200 batch-64 continuation")
         command.extend(
             [
                 f"algorithm.seed.june24_fixed_manifest={args.fixed_manifest}",
@@ -436,8 +438,6 @@ def _hydra_command(
             ]
         )
     else:
-        if args.extend_from_update is not None:
-            raise ValueError("--extend-from-update is valid only for the all-200 batch-64 continuation")
         command.extend(
             [
                 f"algorithm.seed.june24_cohort_manifest={args.cohort_manifest}",
