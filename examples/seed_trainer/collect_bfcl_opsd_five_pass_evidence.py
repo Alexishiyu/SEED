@@ -1,4 +1,4 @@
-"""Validate a June 24 all-200 run, including the checkpoint-10 -> 20 extension."""
+"""Validate a June 24 all-200 run and its audited checkpoint continuations."""
 
 from __future__ import annotations
 
@@ -425,18 +425,53 @@ def main() -> None:
     total_updates = int(schedule_value["total_updates"])
     updates_per_iteration = int(schedule_value["updates_per_iteration"])
     iterations = int(schedule_value["iterations"])
-    if iterations == 10:
+    if iterations in {10, 20}:
+        extension_from = 10 if iterations == 10 else 20
+        target_update = 20 if iterations == 10 else 40
         extension_parent = provenance.get("extension_parent") or {}
         parent_snapshot_path = (
-            run_root / "metadata" / "privileged_june24_checkpoint10_parent.json"
+            run_root
+            / "metadata"
+            / f"privileged_june24_checkpoint{extension_from}_parent.json"
         )
         if (
-            extension_parent.get("extension_from_update") != 10
-            or extension_parent.get("target_update") != 20
+            extension_parent.get("extension_from_update") != extension_from
+            or extension_parent.get("target_update") != target_update
             or not parent_snapshot_path.is_file()
             or _json(parent_snapshot_path) != extension_parent
         ):
-            raise RuntimeError("checkpoint-20 run lacks exact immutable checkpoint-10 lineage")
+            raise RuntimeError(
+                f"checkpoint-{target_update} run lacks exact immutable "
+                f"checkpoint-{extension_from} lineage"
+            )
+        if iterations == 20:
+            checkpoint20_provenance_path = Path(
+                extension_parent["parent_provenance_path"]
+            )
+            if (
+                not checkpoint20_provenance_path.is_file()
+                or sha256_file(checkpoint20_provenance_path)
+                != extension_parent.get("parent_provenance_sha256")
+            ):
+                raise RuntimeError(
+                    "checkpoint-40 parent provenance is missing or hash-drifted"
+                )
+            checkpoint20_provenance = _json(checkpoint20_provenance_path)
+            checkpoint10_parent = checkpoint20_provenance.get("extension_parent") or {}
+            checkpoint10_snapshot = (
+                run_root
+                / "metadata"
+                / "privileged_june24_checkpoint10_parent.json"
+            )
+            if (
+                checkpoint10_parent.get("extension_from_update") != 10
+                or checkpoint10_parent.get("target_update") != 20
+                or not checkpoint10_snapshot.is_file()
+                or _json(checkpoint10_snapshot) != checkpoint10_parent
+            ):
+                raise RuntimeError(
+                    "checkpoint-40 run lacks nested immutable checkpoint-10 lineage"
+                )
     elif iterations != 5:
         raise RuntimeError(f"unsupported June 24 iteration count: {iterations}")
     checkpoint_steps = tuple(

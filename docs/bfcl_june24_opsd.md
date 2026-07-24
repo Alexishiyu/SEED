@@ -267,3 +267,33 @@ task success transitions, segment durations, and GPU/host/Drive resource use.
 Any non-finite metric, checksum discontinuity, mask/alignment failure, nonzero RL
 gradient, learning-rate drift, missing validation coverage, or unchanged LoRA
 checksum stops the next segment while preserving the checkpoint.
+
+### Checkpoint-20 to checkpoint-40 continuation
+
+After checkpoint 20, update 20, and ordinary-prompt validation step 20 are
+complete, the batch-64 profile supports one further fail-closed continuation.
+Materialize a twenty-iteration split manifest and train-only bank in the same run
+root. Its first ten schedules must exactly reproduce the checkpoint-20 parent;
+deterministic schedules 11-20 add 1,280 rollouts and twenty strict-Adam updates.
+
+Launch with the unchanged batch, optimizer, model, LoRA, prompt, OPD, and
+constant `1e-6` learning-rate settings plus:
+
+```bash
+python examples/seed_trainer/run_bfcl_opsd.py \
+  --june24-skill-bank /run/inputs/extension_to40/june24_train128_skill_bank.json \
+  --cohort-manifest /run/inputs/june24_all200_cohort.json \
+  --split-manifest /run/inputs/extension_to40/june24_train128_val72_b64_split.json \
+  --run-root /content/drive/MyDrive/bfcl_qwen_experiment/seed_opsd_colab/<existing-run> \
+  --bfcl-root /path/to/gorilla/berkeley-function-call-leaderboard \
+  --iterations 20 --extend-from-update 20 --batch-size 64 --checkpoint-updates 1 \
+  --optimizer adam --lr-schedule constant --final-lr 1e-6 \
+  --inline-same-prompt-diagnostics --resume auto --rlpaper-sha <sha>
+```
+
+Run a preflight first, then use `--execute --stop-after-update 21` as the
+continuation gate. After checkpoint 21 and its diagnostics pass, resume without
+the stop flag through checkpoint 40. Validation remains at epoch boundaries,
+producing the combined curve at steps `0, 2, 4, ..., 40`. Immutable checkpoint-20
+plan, provenance, input hashes, update-20 hash, validation-20 hash, and nested
+checkpoint-10 lineage are required before the new plan is written.

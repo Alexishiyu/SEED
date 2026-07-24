@@ -244,11 +244,128 @@ def test_checkpoint20_extension_reuses_checkpoint10_snapshots_after_preflight(tm
 
     assert snapshot["extension_from_update"] == 10
     assert snapshot["target_update"] == 20
+    assert snapshot["first_five_schedules_identical"] is True
     assert json.loads(
         (metadata_root / "privileged_june24_provenance_at_checkpoint10.json").read_text(
             encoding="utf-8"
         )
     ) == parent
+
+
+def test_checkpoint40_extension_requires_completed_checkpoint20_parent(tmp_path):
+    launcher = Path(__file__).resolve().parents[2] / "examples/seed_trainer/run_bfcl_opsd.py"
+    tree = ast.parse(launcher.read_text(encoding="utf-8"))
+    function_names = {
+        "_read_json",
+        "_write_json",
+        "_write_json_immutable",
+        "_validate_extension_parent",
+    }
+    function_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in function_names
+    ]
+    schedules = [
+        {"iteration": iteration, "task_ids": ["multi_turn_base_1"]}
+        for iteration in range(1, 21)
+    ]
+
+    def sha256_file(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    namespace = {
+        "Any": object,
+        "Mapping": dict,
+        "Path": Path,
+        "argparse": argparse,
+        "json": json,
+        "sha256_file": sha256_file,
+        "checkpoint_step": lambda _path: 20,
+        "validate_stratified_split_manifest": (
+            lambda _payload, cohort_manifest: ([], [], schedules[:10])
+        ),
+    }
+    exec(compile(ast.Module(body=function_nodes, type_ignores=[]), launcher, "exec"), namespace)
+
+    run_root = tmp_path / "run"
+    metadata_root = run_root / "metadata"
+    evidence_root = run_root / "evidence" / "privileged_june24"
+    metadata_root.mkdir(parents=True)
+    (evidence_root / "updates").mkdir(parents=True)
+    (evidence_root / "validation").mkdir(parents=True)
+    parent_split = tmp_path / "parent_split.json"
+    parent_cohort = tmp_path / "parent_cohort.json"
+    parent_split.write_text("{}\n", encoding="utf-8")
+    parent_cohort.write_text("{}\n", encoding="utf-8")
+    (evidence_root / "updates" / "step_000020.json").write_text("{}\n", encoding="utf-8")
+    (evidence_root / "validation" / "global_step_000020.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    train_ids = ["multi_turn_base_1"]
+    validation_ids = ["multi_turn_base_2"]
+    parent = {
+        "mode": "june24_all200_train128_val72_b64",
+        "split_profile": "128x72_b64",
+        "iterations": 10,
+        "batch_size": 64,
+        "updates_per_iteration": 2,
+        "total_updates": 20,
+        "completed_update": 20,
+        "status": "training-finished",
+        "train_task_ids": train_ids,
+        "validation_task_ids": validation_ids,
+        "optimizer": {
+            "name": "adam",
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+            "weight_decay": 0.0,
+        },
+        "learning_rate": {
+            "style": "constant",
+            "warmup_updates": 0,
+            "warmup_target_lr": None,
+            "final_lr": 1e-6,
+        },
+        "opd": {"only": True, "loss_coef": 1.0, "gate_beta": 5.0},
+        "split_manifest_path": str(parent_split),
+        "cohort_manifest_path": str(parent_cohort),
+        "seed_sha": "checkpoint20-sha",
+        "seed_sha_history": ["parent-sha", "checkpoint20-sha"],
+        "train_dataset_path": str(tmp_path / "train.parquet"),
+        "train_dataset_sha256": "train-sha",
+    }
+    (metadata_root / "privileged_june24_provenance.json").write_text(
+        json.dumps(parent), encoding="utf-8"
+    )
+    (metadata_root / "privileged_june24_plan.json").write_text(
+        json.dumps({"command": ["checkpoint20"]}), encoding="utf-8"
+    )
+    args = SimpleNamespace(
+        extend_from_update=20,
+        iterations=20,
+        run_root=run_root,
+        arm="privileged_june24",
+    )
+
+    snapshot = namespace["_validate_extension_parent"](
+        args=args,
+        split_profile="128x72_b64",
+        train_ids=train_ids,
+        validation_ids=validation_ids,
+        schedules=schedules,
+        total_updates=40,
+    )
+
+    assert snapshot["extension_from_update"] == 20
+    assert snapshot["target_update"] == 40
+    assert snapshot["parent_schedule_prefix_iterations"] == 10
+    assert (
+        metadata_root / "privileged_june24_provenance_at_checkpoint20.json"
+    ).is_file()
+    assert (
+        metadata_root / "privileged_june24_checkpoint20_parent.json"
+    ).is_file()
 
 
 def test_validation_batch_size_exactly_partitions_72_without_changing_train_batch():
@@ -440,7 +557,10 @@ def test_builds_stratified_128_72_with_two_batches_per_iteration(tmp_path):
     assert bank["source_task_count"] == 200
 
 
-def test_batch64_checkpoint20_extension_preserves_first_five_schedules(tmp_path):
+@pytest.mark.parametrize(("iterations", "expected_updates"), [(10, 20), (20, 40)])
+def test_batch64_extensions_preserve_parent_schedule_prefix(
+    tmp_path, iterations, expected_updates
+):
     cohort_path, _, _, _ = _all200_evidence(tmp_path)
     original = build_stratified_split_manifest(
         cohort_path,
@@ -449,7 +569,7 @@ def test_batch64_checkpoint20_extension_preserves_first_five_schedules(tmp_path)
     )
     extension = build_stratified_split_manifest(
         cohort_path,
-        iterations=10,
+        iterations=iterations,
         batch_size=64,
         split_profile=LARGE_BATCH_SPLIT_PROFILE,
     )
@@ -463,9 +583,9 @@ def test_batch64_checkpoint20_extension_preserves_first_five_schedules(tmp_path)
     assert extension["training_schedule"]["iteration_schedules"][:5] == original[
         "training_schedule"
     ]["iteration_schedules"]
-    assert extension["training_schedule"]["total_updates"] == 20
-    assert extension["training_schedule"]["total_rollouts"] == 1280
-    assert len(schedules) == 10
+    assert extension["training_schedule"]["total_updates"] == expected_updates
+    assert extension["training_schedule"]["total_rollouts"] == 128 * iterations
+    assert len(schedules) == iterations
     assert len(train_ids) == 128
     assert len(validation_ids) == 72
     for expected_iteration, schedule in enumerate(schedules, start=1):

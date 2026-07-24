@@ -185,39 +185,51 @@ def _validate_extension_parent(
     schedules: list[dict[str, Any]],
     total_updates: int,
 ) -> dict[str, Any] | None:
-    """Require an exact completed checkpoint-10 parent before extending to 20."""
+    """Require an exact completed parent before extending the batch-64 run."""
 
     if args.extend_from_update is None:
         if split_profile == "128x72_b64" and args.iterations != 5:
             raise ValueError(
-                "the 10-iteration batch-64 schedule requires --extend-from-update=10"
+                "an extended batch-64 schedule requires "
+                "--extend-from-update=10 or --extend-from-update=20"
             )
         return None
+    extension_contracts = {
+        10: {"parent_iterations": 5, "target_iterations": 10, "target_update": 20},
+        20: {"parent_iterations": 10, "target_iterations": 20, "target_update": 40},
+    }
+    extension_from = int(args.extend_from_update)
+    contract = extension_contracts.get(extension_from)
     if (
         split_profile != "128x72_b64"
-        or args.extend_from_update != 10
-        or args.iterations != 10
-        or total_updates != 20
+        or contract is None
+        or args.iterations != contract["target_iterations"]
+        or total_updates != contract["target_update"]
     ):
         raise ValueError(
-            "the canonical extension requires split profile 128x72_b64, "
-            "--extend-from-update=10, --iterations=10, and total_updates=20"
+            "the canonical extensions require split profile 128x72_b64 and either "
+            "--extend-from-update=10 with --iterations=10 and total_updates=20, "
+            "or --extend-from-update=20 with --iterations=20 and total_updates=40"
         )
 
     metadata_path = args.run_root / "metadata" / f"{args.arm}_provenance.json"
     plan_path = args.run_root / "metadata" / f"{args.arm}_plan.json"
     provenance_snapshot_path = (
-        args.run_root / "metadata" / f"{args.arm}_provenance_at_checkpoint10.json"
+        args.run_root
+        / "metadata"
+        / f"{args.arm}_provenance_at_checkpoint{extension_from}.json"
     )
     plan_snapshot_path = (
-        args.run_root / "metadata" / f"{args.arm}_plan_at_checkpoint10.json"
+        args.run_root / "metadata" / f"{args.arm}_plan_at_checkpoint{extension_from}.json"
     )
     snapshot_presence = (
         provenance_snapshot_path.is_file(),
         plan_snapshot_path.is_file(),
     )
     if any(snapshot_presence) and not all(snapshot_presence):
-        raise RuntimeError("checkpoint-10 extension snapshots are incomplete")
+        raise RuntimeError(
+            f"checkpoint-{extension_from} extension snapshots are incomplete"
+        )
     if all(snapshot_presence):
         previous = _read_json(provenance_snapshot_path)
         previous_plan = _read_json(plan_snapshot_path)
@@ -225,15 +237,17 @@ def _validate_extension_parent(
         previous = _read_json(metadata_path)
         previous_plan = _read_json(plan_path)
     else:
-        raise RuntimeError("checkpoint-10 extension requires the original plan and provenance")
+        raise RuntimeError(
+            f"checkpoint-{extension_from} extension requires the parent plan and provenance"
+        )
     required_parent = {
         "mode": "june24_all200_train128_val72_b64",
         "split_profile": "128x72_b64",
-        "iterations": 5,
+        "iterations": contract["parent_iterations"],
         "batch_size": 64,
         "updates_per_iteration": 2,
-        "total_updates": 10,
-        "completed_update": 10,
+        "total_updates": extension_from,
+        "completed_update": extension_from,
         "status": "training-finished",
     }
     mismatches = {
@@ -242,9 +256,13 @@ def _validate_extension_parent(
         if previous.get(key) != expected
     }
     if mismatches:
-        raise RuntimeError(f"checkpoint-10 parent contract mismatch: {mismatches}")
+        raise RuntimeError(
+            f"checkpoint-{extension_from} parent contract mismatch: {mismatches}"
+        )
     if previous.get("train_task_ids") != train_ids or previous.get("validation_task_ids") != validation_ids:
-        raise RuntimeError("extension train/validation identities differ from checkpoint 10")
+        raise RuntimeError(
+            f"extension train/validation identities differ from checkpoint {extension_from}"
+        )
     if previous.get("optimizer") != {
         "name": "adam",
         "betas": [0.9, 0.999],
@@ -270,29 +288,44 @@ def _validate_extension_parent(
         _read_json(parent_split_path),
         cohort_manifest=parent_cohort_path,
     )
-    if schedules[:5] != parent_schedules:
-        raise RuntimeError("extension schedules 1-5 do not exactly reproduce the parent run")
-    latest_checkpoint = checkpoint_step(args.run_root / "checkpoints" / args.arm)
-    if latest_checkpoint < args.extend_from_update or latest_checkpoint > total_updates:
+    parent_iterations = int(contract["parent_iterations"])
+    if schedules[:parent_iterations] != parent_schedules:
         raise RuntimeError(
-            "extension requires a resumable checkpoint between 10 and 20; "
+            f"extension schedules 1-{parent_iterations} do not exactly reproduce "
+            f"the checkpoint-{extension_from} parent run"
+        )
+    latest_checkpoint = checkpoint_step(args.run_root / "checkpoints" / args.arm)
+    if latest_checkpoint < extension_from or latest_checkpoint > total_updates:
+        raise RuntimeError(
+            f"extension requires a resumable checkpoint between {extension_from} "
+            f"and {total_updates}; "
             f"observed {latest_checkpoint}"
         )
     required_evidence = [
-        args.run_root / "evidence" / args.arm / "updates" / "step_000010.json",
-        args.run_root / "evidence" / args.arm / "validation" / "global_step_000010.json",
+        args.run_root
+        / "evidence"
+        / args.arm
+        / "updates"
+        / f"step_{extension_from:06d}.json",
+        args.run_root
+        / "evidence"
+        / args.arm
+        / "validation"
+        / f"global_step_{extension_from:06d}.json",
     ]
     missing = [str(path) for path in required_evidence if not path.is_file()]
     if missing:
-        raise RuntimeError(f"checkpoint-10 extension evidence is incomplete: {missing}")
+        raise RuntimeError(
+            f"checkpoint-{extension_from} extension evidence is incomplete: {missing}"
+        )
 
     _write_json_immutable(provenance_snapshot_path, dict(previous))
     _write_json_immutable(plan_snapshot_path, dict(previous_plan))
 
     snapshot = {
-        "schema_version": "seed.bfcl.checkpoint10_parent.v1",
-        "extension_from_update": 10,
-        "target_update": 20,
+        "schema_version": f"seed.bfcl.checkpoint{extension_from}_parent.v1",
+        "extension_from_update": extension_from,
+        "target_update": total_updates,
         "parent_seed_sha": previous.get("seed_sha"),
         "parent_seed_sha_history": previous.get("seed_sha_history") or [previous.get("seed_sha")],
         "parent_provenance_path": str(provenance_snapshot_path),
@@ -303,13 +336,26 @@ def _validate_extension_parent(
         "parent_split_manifest_sha256": sha256_file(parent_split_path),
         "parent_train_dataset_path": previous.get("train_dataset_path"),
         "parent_train_dataset_sha256": previous.get("train_dataset_sha256"),
-        "checkpoint_path": str(args.run_root / "checkpoints" / args.arm / "global_step_10"),
+        "checkpoint_path": str(
+            args.run_root
+            / "checkpoints"
+            / args.arm
+            / f"global_step_{extension_from}"
+        ),
         "update_evidence_sha256": sha256_file(required_evidence[0]),
         "validation_evidence_sha256": sha256_file(required_evidence[1]),
-        "first_five_schedules_identical": True,
     }
+    if extension_from == 10:
+        # Preserve the exact checkpoint-10 snapshot schema already committed by
+        # live 10->20 runs so immutable resume retries remain byte-compatible.
+        snapshot["first_five_schedules_identical"] = True
+    else:
+        snapshot["parent_schedule_prefix_iterations"] = parent_iterations
+        snapshot["parent_schedule_prefix_identical"] = True
     _write_json_immutable(
-        args.run_root / "metadata" / f"{args.arm}_checkpoint10_parent.json",
+        args.run_root
+        / "metadata"
+        / f"{args.arm}_checkpoint{extension_from}_parent.json",
         snapshot,
     )
     return snapshot
@@ -498,7 +544,10 @@ def parse_args() -> argparse.Namespace:
         "--extend-from-update",
         type=int,
         default=None,
-        help="Fail-closed batch-64 continuation; canonical value is 10 with --iterations=10",
+        help=(
+            "Fail-closed batch-64 continuation: use 10 with --iterations=10 "
+            "or 20 with --iterations=20"
+        ),
     )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -570,7 +619,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "128x72_b64": {
                 "batch_size": 64,
                 "updates_per_iteration": 2,
-                "allowed_iterations": (5, 10),
+                "allowed_iterations": (5, 10, 20),
                 "lr_schedule": "constant",
             },
         }

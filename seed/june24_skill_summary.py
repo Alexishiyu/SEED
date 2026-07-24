@@ -76,10 +76,11 @@ SPLIT_PROFILES = {
         "schema_version": ALL200_SPLIT_128_SCHEMA_VERSION,
         "selection": "june24_all200/stratified_128_72_b64",
         "batch_size": 64,
-        # Ten iterations are reserved for the explicit checkpoint-10 -> 20
-        # continuation.  The launcher separately requires an intact
-        # checkpoint-10 parent contract before it will execute that schedule.
-        "allowed_iterations": (DEFAULT_TRAIN_ITERATIONS, 10),
+        # Ten and twenty iterations are reserved for the explicit
+        # checkpoint-10 -> 20 and checkpoint-20 -> 40 continuations. The
+        # launcher separately requires an intact completed parent contract
+        # before it will execute either extended schedule.
+        "allowed_iterations": (DEFAULT_TRAIN_ITERATIONS, 10, 20),
         "train_counts": EXPECTED_TRAIN_128_OUTCOME_COUNTS,
         "validation_counts": EXPECTED_VALIDATION_72_OUTCOME_COUNTS,
     },
